@@ -44,8 +44,7 @@ let targetDocUri = null;
 let diagnostics;
 let debounceTimer;
 let syncTimer;
-let isCompiling = false;
-let pendingDoc = null;
+let latestCompileSeq = 0;
 let wasErrorState = false;
 function activate(context) {
     diagnostics = vscode.languages.createDiagnosticCollection("realtime-tex");
@@ -61,7 +60,7 @@ function activate(context) {
         openOrRevealPanel(context, editor.document);
         triggerCompile(editor.document);
     });
-    // 未保存バッファの編集をリアルタイムにフック
+    // 未保存バッファの編集を適応型デバウンスでリアルタイムフック
     const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
         if (!panel || !targetDocUri)
             return;
@@ -69,12 +68,13 @@ function activate(context) {
             return;
         if (debounceTimer)
             clearTimeout(debounceTimer);
-        const delay = wasErrorState ? 100 : 300;
+        const lastChange = event.contentChanges[event.contentChanges.length - 1]?.text ?? "";
+        const isBoundary = /[\n}\]$。．.、,]$/.test(lastChange);
+        const delay = wasErrorState || isBoundary ? 80 : 180;
         debounceTimer = setTimeout(() => {
             triggerCompile(event.document);
         }, delay);
     });
-    // 別の .tex タブに切り替えたらプレビュー対象も追従
     const activeEditorListener = vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (!panel || !editor)
             return;
@@ -86,7 +86,7 @@ function activate(context) {
             }
         }
     });
-    // カーソル移動を検知して SyncTeX プレビュー同期
+    // SyncTeX 追従（20ms デバウンスで高応答化）
     const selectionListener = vscode.window.onDidChangeTextEditorSelection((event) => {
         if (!panel || !targetDocUri || !engine)
             return;
@@ -100,7 +100,7 @@ function activate(context) {
             if (target && panel) {
                 panel.webview.postMessage({ type: "sync", target });
             }
-        }, 60);
+        }, 20);
     });
     context.subscriptions.push(openCmd, changeListener, activeEditorListener, selectionListener);
 }
@@ -139,15 +139,16 @@ function openOrRevealPanel(context, doc) {
 async function triggerCompile(doc) {
     if (!engine || !panel)
         return;
-    if (isCompiling) {
-        pendingDoc = doc;
-        return;
-    }
-    isCompiling = true;
+    const mySeq = ++latestCompileSeq;
     panel.webview.postMessage({ type: "compiling" });
     try {
         const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
+        // 進行中の古いジョブは Rust 側で自動 abort されるため、待たずに即送信する
         const res = await engine.compile(doc.getText(), docDir);
+        // キャンセル済み、または既に新しいリクエストが走っている場合は無視
+        if (res.status === "cancelled" || mySeq !== latestCompileSeq || !panel) {
+            return;
+        }
         if (res.status === "updated" && res.pdf_base64) {
             wasErrorState = false;
             diagnostics.delete(doc.uri);
@@ -160,14 +161,8 @@ async function triggerCompile(doc) {
         }
     }
     catch (err) {
-        vscode.window.showErrorMessage(`Realtime TeX Engine Error: ${String(err)}`);
-    }
-    finally {
-        isCompiling = false;
-        if (pendingDoc) {
-            const next = pendingDoc;
-            pendingDoc = null;
-            triggerCompile(next);
+        if (mySeq === latestCompileSeq) {
+            vscode.window.showErrorMessage(`Realtime TeX Engine Error: ${String(err)}`);
         }
     }
 }
@@ -182,7 +177,6 @@ function publishDiagnostics(doc, res) {
         }
     }
     else if (res.error_detail) {
-        // "! ... l.17 ..." から行番号を抽出して波線を引く
         const m = res.error_detail.match(/l\.(\d+)/);
         const lineIdx = m ? Math.max(0, parseInt(m[1], 10) - 1) : 0;
         const range = new vscode.Range(lineIdx, 0, lineIdx, 999);
@@ -267,7 +261,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       pointer-events: none;
       opacity: 0;
     }
-    .sync-marker.flash { animation: syncFlash 1.2s ease-out forwards; }
+    .sync-marker.flash { animation: syncFlash 0.9s ease-out forwards; }
     @keyframes syncFlash { 0% { opacity: 1; } 100% { opacity: 0; } }
     .error-bar {
       display: none;
@@ -310,6 +304,8 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
     const mMisses = document.getElementById("m-misses");
     const mTime = document.getElementById("m-time");
 
+    let renderGeneration = 0;
+
     function base64ToUint8Array(b64) {
       const bin = atob(b64);
       const len = bin.length;
@@ -318,38 +314,104 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       return bytes;
     }
 
-    async function renderPdf(data) {
-      const prevScrollTop = previewEl.scrollTop;
-      const pdf = await pdfjsLib.getDocument({ data }).promise;
-      const fragment = document.createDocumentFragment();
-
-      for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
-        const page = await pdf.getPage(pageNum);
-        const viewport = page.getViewport({ scale: PDF_SCALE });
+    function ensurePageSlots(numPages) {
+      const existing = previewEl.querySelectorAll(".pdf-page-wrap");
+      for (let i = existing.length; i < numPages; i++) {
         const wrap = document.createElement("div");
         wrap.className = "pdf-page-wrap";
-        wrap.dataset.page = String(pageNum);
-
+        wrap.dataset.page = String(i + 1);
         const canvas = document.createElement("canvas");
+        wrap.appendChild(canvas);
+        previewEl.appendChild(wrap);
+      }
+      for (let i = existing.length - 1; i >= numPages; i--) {
+        existing[i].remove();
+      }
+    }
+
+    // 現在のスクロール位置に表示されているページを最優先で並べる
+    function getPrioritizedPages(numPages) {
+      const viewTop = previewEl.scrollTop;
+      const viewBottom = viewTop + previewEl.clientHeight;
+      const wraps = previewEl.querySelectorAll(".pdf-page-wrap");
+
+      const visible = [];
+      const others = [];
+
+      for (let p = 1; p <= numPages; p++) {
+        const wrap = wraps[p - 1];
+        if (!wrap || wrap.offsetHeight === 0) {
+          (p <= 2 ? visible : others).push(p);
+          continue;
+        }
+        const top = wrap.offsetTop;
+        const bottom = top + wrap.offsetHeight;
+        if (bottom >= viewTop - 400 && top <= viewBottom + 400) {
+          visible.push(p);
+        } else {
+          others.push(p);
+        }
+      }
+      return { visible, others };
+    }
+
+    async function renderSinglePage(pdf, pageNum, gen) {
+      if (gen !== renderGeneration) return;
+      const page = await pdf.getPage(pageNum);
+      if (gen !== renderGeneration) return;
+
+      const viewport = page.getViewport({ scale: PDF_SCALE });
+      const offscreen = document.createElement("canvas");
+      offscreen.width = viewport.width;
+      offscreen.height = viewport.height;
+      const offCtx = offscreen.getContext("2d");
+
+      await page.render({ canvasContext: offCtx, viewport }).promise;
+      if (gen !== renderGeneration) return;
+
+      const wrap = previewEl.querySelector('.pdf-page-wrap[data-page="' + pageNum + '"]');
+      if (!wrap) return;
+      const canvas = wrap.querySelector("canvas");
+      if (canvas.width !== viewport.width || canvas.height !== viewport.height) {
         canvas.width = viewport.width;
         canvas.height = viewport.height;
-        const ctx = canvas.getContext("2d");
-
-        await page.render({ canvasContext: ctx, viewport }).promise;
-        wrap.appendChild(canvas);
-        fragment.appendChild(wrap);
       }
+      const ctx = canvas.getContext("2d");
+      ctx.drawImage(offscreen, 0, 0);
+    }
 
-      previewEl.replaceChildren(fragment);
-      previewEl.scrollTop = prevScrollTop;
+    async function renderPdfPrioritized(data) {
+      const gen = ++renderGeneration;
+      const pdf = await pdfjsLib.getDocument({ data }).promise;
+      if (gen !== renderGeneration) return;
+
+      ensurePageSlots(pdf.numPages);
+      const { visible, others } = getPrioritizedPages(pdf.numPages);
+
+      // 1. 可視ページを並列で最優先描画（体感レイテンシを最小化）
+      await Promise.all(visible.map((p) => renderSinglePage(pdf, p, gen)));
+      if (gen !== renderGeneration) return;
+
+      // 2. 画面外の残ページはバックグラウンドで順次描画
+      for (const p of others) {
+        if (gen !== renderGeneration) return;
+        await new Promise((r) => setTimeout(r, 0));
+        await renderSinglePage(pdf, p, gen);
+      }
     }
 
     function scrollToTarget(target) {
       const wrap = previewEl.querySelector('.pdf-page-wrap[data-page="' + target.page + '"]');
       if (!wrap) return;
       const yPx = target.y_pt * PDF_SCALE;
-      const desired = wrap.offsetTop + yPx - previewEl.clientHeight * 0.35;
-      previewEl.scrollTo({ top: Math.max(0, desired), behavior: "smooth" });
+      const desired = Math.max(0, wrap.offsetTop + yPx - previewEl.clientHeight * 0.35);
+      const dist = Math.abs(previewEl.scrollTop - desired);
+
+      // 近距離移動はアニメーションなしで即時追従
+      previewEl.scrollTo({
+        top: desired,
+        behavior: dist < 240 ? "auto" : "smooth",
+      });
 
       let marker = wrap.querySelector(".sync-marker");
       if (!marker) {
@@ -376,7 +438,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
         mTime.textContent = r.elapsed_ms + " ms";
         errorBar.classList.remove("visible");
 
-        await renderPdf(base64ToUint8Array(r.pdf_base64));
+        await renderPdfPrioritized(base64ToUint8Array(r.pdf_base64));
         statusEl.textContent = "Synced";
         statusEl.dataset.state = "ok";
       } else if (msg.type === "error") {

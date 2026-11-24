@@ -7,8 +7,11 @@ mod xref;
 use compiler::{CompileResponse, EngineState};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::Arc;
 use synctex::PdfSyncTarget;
 use tokio::io::{self, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
 
 #[derive(Deserialize)]
 #[serde(tag = "type")]
@@ -47,12 +50,15 @@ enum Response {
 
 #[tokio::main]
 async fn main() {
-    let engine = EngineState::new();
+    let engine = Arc::new(EngineState::new());
+    let stdout = Arc::new(Mutex::new(io::stdout()));
     let stdin = io::stdin();
-    let mut stdout = io::stdout();
     let mut lines = BufReader::new(stdin).lines();
 
-    eprintln!("[realtime-tex-server] ready on stdio");
+    // 進行中のコンパイルタスク（新しい編集が来たら即 abort して差し替える）
+    let mut active_compile: Option<(u64, JoinHandle<()>)> = None;
+
+    eprintln!("[realtime-tex-server] ready on stdio (prewarm + preemption enabled)");
 
     while let Ok(Some(line)) = lines.next_line().await {
         let trimmed = line.trim();
@@ -67,7 +73,7 @@ async fn main() {
                     id: 0,
                     message: format!("Invalid JSON request: {}", e),
                 };
-                write_response(&mut stdout, &err_resp).await;
+                write_response(&stdout, &err_resp).await;
                 continue;
             }
         };
@@ -78,32 +84,70 @@ async fn main() {
                 source,
                 document_dir,
             } => {
+                // 進行中の古いコンパイルがあれば即キャンセル（kill_on_drop により lualatex も即終了）
+                if let Some((old_id, handle)) = active_compile.take() {
+                    if !handle.is_finished() {
+                        handle.abort();
+                        let cancelled = Response::CompileResult {
+                            id: old_id,
+                            result: CompileResponse {
+                                status: "cancelled".into(),
+                                pdf_base64: None,
+                                error_blocks: vec![],
+                                cache_hits: 0,
+                                cache_misses: 0,
+                                resolved_labels_count: 0,
+                                elapsed_ms: 0,
+                                mode: "cancelled".into(),
+                                error_detail: None,
+                            },
+                        };
+                        write_response(&stdout, &cancelled).await;
+                    }
+                }
+
+                let engine_clone = Arc::clone(&engine);
+                let stdout_clone = Arc::clone(&stdout);
                 let doc_dir = document_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
-                let result = engine.compile_incremental(&source, doc_dir.as_deref()).await;
-                let resp = Response::CompileResult { id, result };
-                write_response(&mut stdout, &resp).await;
+
+                let handle = tokio::spawn(async move {
+                    let result = engine_clone
+                        .compile_incremental(&source, doc_dir.as_deref())
+                        .await;
+                    let resp = Response::CompileResult { id, result };
+                    write_response(&stdout_clone, &resp).await;
+                });
+
+                active_compile = Some((id, handle));
             }
             Request::Sync { id, line } => {
                 let target = engine.sync_to_pdf(line);
                 let resp = Response::SyncResult { id, target };
-                write_response(&mut stdout, &resp).await;
+                write_response(&stdout, &resp).await;
             }
             Request::Shutdown { id } => {
+                if let Some((_, handle)) = active_compile.take() {
+                    handle.abort();
+                }
                 engine.shutdown(false).await;
                 let resp = Response::ShutdownOk { id };
-                write_response(&mut stdout, &resp).await;
+                write_response(&stdout, &resp).await;
                 break;
             }
         }
     }
 
+    if let Some((_, handle)) = active_compile.take() {
+        handle.abort();
+    }
     engine.shutdown(false).await;
 }
 
-async fn write_response(stdout: &mut io::Stdout, resp: &Response) {
+async fn write_response(stdout: &Arc<Mutex<io::Stdout>>, resp: &Response) {
     if let Ok(mut json) = serde_json::to_string(resp) {
         json.push('\n');
-        let _ = stdout.write_all(json.as_bytes()).await;
-        let _ = stdout.flush().await;
+        let mut out = stdout.lock().await;
+        let _ = out.write_all(json.as_bytes()).await;
+        let _ = out.flush().await;
     }
 }

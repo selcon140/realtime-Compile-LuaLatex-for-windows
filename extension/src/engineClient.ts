@@ -13,7 +13,7 @@ export interface TexBlock {
 }
 
 export interface CompileResult {
-  status: "updated" | "fallback_error" | "compile_error";
+  status: "updated" | "fallback_error" | "compile_error" | "cancelled";
   pdf_base64: string | null;
   error_blocks: TexBlock[];
   cache_hits: number;

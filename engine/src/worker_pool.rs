@@ -1,18 +1,31 @@
+use std::collections::VecDeque;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::process::Command;
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
+const POOL_SIZE: usize = 2;
 const DEFERRED_PACKAGES: &[&str] = &["hyperref", "bookmark", "cleveref", "preview"];
+const PREWARM_MARKER: &str = "@@PREWARM_READY@@";
 
 pub struct JobOutput {
     pub pdf_bytes: Vec<u8>,
     pub synctex_gz: Option<Vec<u8>>,
+}
+
+/// タスクがキャンセル（abort）されても一時スロットディレクトリを確実に削除する RAII ガード
+struct SlotDirGuard(PathBuf);
+
+impl Drop for SlotDirGuard {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
 }
 
 pub fn split_preamble_for_format(preamble: &str) -> (String, String) {
@@ -34,36 +47,46 @@ pub fn split_preamble_for_format(preamble: &str) -> (String, String) {
     (dumpable, deferred)
 }
 
+#[derive(Clone, PartialEq, Eq)]
+struct WarmKey {
+    preamble_hash: String,
+    document_dir: Option<PathBuf>,
+}
+
 #[derive(Clone)]
-struct FormatState {
-    hash: String,
-    use_fmt: bool,
+struct PoolConfig {
+    key: WarmKey,
     dumpable_preamble: String,
 }
 
+struct PrewarmedWorker {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    slot_dir: PathBuf,
+    key: WarmKey,
+}
+
 pub struct LuaTexWorkerPool {
-    fmt_dir: PathBuf,
     slots_root: PathBuf,
-    format_state: Mutex<Option<FormatState>>,
+    config: Mutex<Option<PoolConfig>>,
+    idle_workers: Mutex<VecDeque<PrewarmedWorker>>,
     slot_counter: AtomicUsize,
     is_shutting_down: AtomicBool,
 }
 
 impl LuaTexWorkerPool {
     pub fn new(work_dir: &Path) -> Arc<Self> {
-        let fmt_dir = work_dir.join("formats");
         let slots_root = work_dir.join("worker_slots");
-
         if slots_root.exists() {
             let _ = fs::remove_dir_all(&slots_root);
         }
-        fs::create_dir_all(&fmt_dir).unwrap();
         fs::create_dir_all(&slots_root).unwrap();
 
         Arc::new(Self {
-            fmt_dir,
             slots_root,
-            format_state: Mutex::new(None),
+            config: Mutex::new(None),
+            idle_workers: Mutex::new(VecDeque::new()),
             slot_counter: AtomicUsize::new(0),
             is_shutting_down: AtomicBool::new(false),
         })
@@ -71,60 +94,81 @@ impl LuaTexWorkerPool {
 
     pub async fn shutdown(&self) {
         self.is_shutting_down.store(true, Ordering::SeqCst);
+
+        let workers: Vec<PrewarmedWorker> = {
+            let mut pool = self.idle_workers.lock().await;
+            pool.drain(..).collect()
+        };
+        for mut w in workers {
+            let _ = w.child.kill().await;
+            let _ = fs::remove_dir_all(&w.slot_dir);
+        }
+
         if self.slots_root.exists() {
             let _ = fs::remove_dir_all(&self.slots_root);
         }
     }
 
-    pub async fn sync_format(
+    /// プリアンブルまたは作業ディレクトリが変わったら待機ワーカーを入れ替えて先行起動
+    pub async fn sync_preamble(
         self: &Arc<Self>,
         dumpable_preamble: &str,
-        fmt_hash: &str,
+        preamble_hash: &str,
+        document_dir: Option<&Path>,
     ) -> Result<(), String> {
         if self.is_shutting_down.load(Ordering::SeqCst) {
             return Err("Worker pool is shutting down".into());
         }
 
+        let new_key = WarmKey {
+            preamble_hash: preamble_hash.to_string(),
+            document_dir: document_dir.map(Path::to_path_buf),
+        };
+
         {
-            let guard = self.format_state.lock().await;
-            if let Some(ref st) = *guard {
-                if st.hash == fmt_hash {
+            let guard = self.config.lock().await;
+            if let Some(ref cfg) = *guard {
+                if cfg.key == new_key {
                     return Ok(());
                 }
             }
         }
 
-        let is_luatexja = dumpable_preamble.contains("ltjs")
-            || dumpable_preamble.contains("luatexja");
-
-        let use_fmt = if is_luatexja {
-            false
-        } else {
-            let fmt_name = format!("fmt_{}", fmt_hash);
-            let fmt_path = self.fmt_dir.join(format!("{}.fmt", fmt_name));
-            if fmt_path.exists() {
-                true
-            } else {
-                self.build_format_file(dumpable_preamble, &fmt_name)
-                    .await
-                    .is_ok()
-            }
+        // 古い待機ワーカーを破棄
+        let stale: Vec<PrewarmedWorker> = {
+            let mut pool = self.idle_workers.lock().await;
+            pool.drain(..).collect()
         };
+        for mut w in stale {
+            let _ = w.child.kill().await;
+            let _ = fs::remove_dir_all(&w.slot_dir);
+        }
 
-        let mut guard = self.format_state.lock().await;
-        *guard = Some(FormatState {
-            hash: fmt_hash.to_string(),
-            use_fmt,
+        let new_cfg = PoolConfig {
+            key: new_key,
             dumpable_preamble: dumpable_preamble.to_string(),
-        });
+        };
+        {
+            let mut guard = self.config.lock().await;
+            *guard = Some(new_cfg.clone());
+        }
+
+        // バックグラウンドでメモリ常駐ワーカーを先行起動
+        for _ in 0..POOL_SIZE {
+            let pool_clone = Arc::clone(self);
+            let cfg_clone = new_cfg.clone();
+            tokio::spawn(async move {
+                pool_clone.spawn_and_enqueue_prewarmed(cfg_clone).await;
+            });
+        }
 
         Ok(())
     }
 
-    /// 分割コンパイル用ジョブ実行（document_dir を TEXINPUTS に渡してローカル画像等を解決）
+    /// プリウォーム済みワーカーがあれば即座に使い、なければ直接起動で実行する
     pub async fn run_job(
         self: &Arc<Self>,
-        fmt_hash: &str,
+        preamble_hash: &str,
         job_body: &str,
         document_dir: Option<&Path>,
     ) -> Result<JobOutput, String> {
@@ -132,72 +176,84 @@ impl LuaTexWorkerPool {
             return Err("Worker pool is shutting down".into());
         }
 
-        let state = {
-            let guard = self.format_state.lock().await;
-            guard.clone().ok_or("Format state not initialized")?
+        let target_key = WarmKey {
+            preamble_hash: preamble_hash.to_string(),
+            document_dir: document_dir.map(Path::to_path_buf),
         };
 
-        let slot_id = self.slot_counter.fetch_add(1, Ordering::Relaxed);
-        let slot_dir = self.slots_root.join(format!("slot_{}", slot_id));
-        fs::create_dir_all(&slot_dir).map_err(|e| e.to_string())?;
-
-        let tex_path = slot_dir.join("job.tex");
-        let pdf_path = slot_dir.join("out.pdf");
-        let synctex_path = slot_dir.join("out.synctex.gz");
-
-        let full_source = if state.use_fmt {
-            job_body.to_string()
-        } else {
-            format!("{}\n{}", state.dumpable_preamble, job_body)
+        let cfg = {
+            let guard = self.config.lock().await;
+            guard.clone().ok_or("Pool config not initialized")?
         };
-        fs::write(&tex_path, full_source).map_err(|e| e.to_string())?;
 
-        let mut cmd = Command::new("lualatex");
-        cmd.current_dir(&slot_dir)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        // 生存しているプリウォーム済みワーカーをプールから1つ取り出す
+        let warm_worker = {
+            let mut pool = self.idle_workers.lock().await;
+            let mut found = None;
+            while let Some(mut w) = pool.pop_front() {
+                let alive = matches!(w.child.try_wait(), Ok(None));
+                if w.key == target_key && alive {
+                    found = Some(w);
+                    break;
+                } else {
+                    let _ = w.child.kill().await;
+                    let _ = fs::remove_dir_all(&w.slot_dir);
+                }
+            }
+            found
+        };
 
-        apply_texinputs(&mut cmd, document_dir);
-
-        if state.use_fmt {
-            #[cfg(windows)]
-            let texformats_env = format!("{};", self.fmt_dir.display());
-            #[cfg(not(windows))]
-            let texformats_env = format!("{}:", self.fmt_dir.display());
-
-            cmd.env("TEXFORMATS", texformats_env)
-                .arg(format!("-fmt=fmt_{}", fmt_hash));
+        // 消費した分を裏で即座に1プロセス補充
+        if warm_worker.is_some() {
+            let pool_clone = Arc::clone(self);
+            let cfg_clone = cfg.clone();
+            tokio::spawn(async move {
+                pool_clone.spawn_and_enqueue_prewarmed(cfg_clone).await;
+            });
         }
 
-        cmd.args([
-            "-jobname=out",
-            "-interaction=nonstopmode",
-            "-halt-on-error",
-            "-synctex=1",
-            "job.tex",
-        ]);
+        if let Some(mut worker) = warm_worker {
+            let _guard = SlotDirGuard(worker.slot_dir.clone());
+            let tex_path = worker.slot_dir.join("job.tex");
+            let pdf_path = worker.slot_dir.join("out.pdf");
+            let synctex_path = worker.slot_dir.join("out.synctex.gz");
 
-        let output = timeout(Duration::from_secs(120), cmd.output())
-            .await
-            .map_err(|_| "lualatex timed out (120s)".to_string())?
-            .map_err(|e| format!("Failed to spawn lualatex: {}", e))?;
+            fs::write(&tex_path, job_body).map_err(|e| e.to_string())?;
 
-        let result = if output.status.success() && pdf_path.exists() {
-            let pdf_bytes = fs::read(&pdf_path).map_err(|e| e.to_string())?;
-            let synctex_gz = fs::read(&synctex_path).ok();
-            Ok(JobOutput {
-                pdf_bytes,
-                synctex_gz,
-            })
-        } else {
-            let log = String::from_utf8_lossy(&output.stdout).into_owned();
-            Err(extract_tex_error_summary(&log))
-        };
+            // メモリ上に展開済みのワーカーへ本文の \input 命令を流し込んで stdin を閉じる
+            if worker.stdin.write_all(b"\\input{job.tex}\n").await.is_ok()
+                && worker.stdin.shutdown().await.is_ok()
+            {
+                let mut log_buf = String::new();
+                let wait_fut = async {
+                    let _ = worker.stdout.read_to_string(&mut log_buf).await;
+                    worker.child.wait().await
+                };
 
-        let _ = fs::remove_dir_all(&slot_dir);
-        result
+                match timeout(Duration::from_secs(120), wait_fut).await {
+                    Ok(Ok(status)) if status.success() && pdf_path.exists() => {
+                        let pdf_bytes = fs::read(&pdf_path).map_err(|e| e.to_string())?;
+                        let synctex_gz = fs::read(&synctex_path).ok();
+                        return Ok(JobOutput {
+                            pdf_bytes,
+                            synctex_gz,
+                        });
+                    }
+                    Ok(Ok(_)) => {
+                        return Err(extract_tex_error_summary(&log_buf));
+                    }
+                    Ok(Err(e)) => return Err(e.to_string()),
+                    Err(_) => {
+                        let _ = worker.child.kill().await;
+                        return Err("lualatex timed out (120s)".into());
+                    }
+                }
+            }
+        }
+
+        // プールが空だった場合（初回起動直後など）は直接実行
+        let full_source = format!("{}\n{}", cfg.dumpable_preamble, job_body);
+        self.run_raw_source(&full_source, document_dir).await
     }
 
     /// 生ソース直接コンパイル（フォールバック用・ローカル画像対応）
@@ -213,6 +269,7 @@ impl LuaTexWorkerPool {
         let slot_id = self.slot_counter.fetch_add(1, Ordering::Relaxed);
         let slot_dir = self.slots_root.join(format!("slot_raw_{}", slot_id));
         fs::create_dir_all(&slot_dir).map_err(|e| e.to_string())?;
+        let _guard = SlotDirGuard(slot_dir.clone());
 
         let tex_path = slot_dir.join("job.tex");
         let pdf_path = slot_dir.join("out.pdf");
@@ -241,7 +298,7 @@ impl LuaTexWorkerPool {
             .map_err(|_| "lualatex timed out (120s)".to_string())?
             .map_err(|e| format!("Failed to spawn lualatex: {}", e))?;
 
-        let result = if output.status.success() && pdf_path.exists() {
+        if output.status.success() && pdf_path.exists() {
             let pdf_bytes = fs::read(&pdf_path).map_err(|e| e.to_string())?;
             let synctex_gz = fs::read(&synctex_path).ok();
             Ok(JobOutput {
@@ -251,47 +308,127 @@ impl LuaTexWorkerPool {
         } else {
             let log = String::from_utf8_lossy(&output.stdout).into_owned();
             Err(extract_tex_error_summary(&log))
-        };
-
-        let _ = fs::remove_dir_all(&slot_dir);
-        result
+        }
     }
 
-    async fn build_format_file(&self, dumpable_preamble: &str, fmt_name: &str) -> Result<(), String> {
-        let src_path = self.fmt_dir.join(format!("{}.tex", fmt_name));
-        let dump_source = format!("{}\n\\endofdump\n", dumpable_preamble);
-        fs::write(&src_path, dump_source).map_err(|e| e.to_string())?;
+    /// バックグラウンドでプリアンブルをメモリ展開し、stdin 待機状態のワーカーを生成してプールへ積む
+    async fn spawn_and_enqueue_prewarmed(&self, cfg: PoolConfig) {
+        if self.is_shutting_down.load(Ordering::SeqCst) {
+            return;
+        }
+
+        let slot_id = self.slot_counter.fetch_add(1, Ordering::Relaxed);
+        let slot_dir = self.slots_root.join(format!("slot_warm_{}", slot_id));
+        if fs::create_dir_all(&slot_dir).is_err() {
+            return;
+        }
+
+        let init_path = slot_dir.join("preamble_init.tex");
+        let init_src = format!(
+            "{}\n\\typeout{{{}}}\n",
+            cfg.dumpable_preamble, PREWARM_MARKER
+        );
+        if fs::write(&init_path, init_src).is_err() {
+            let _ = fs::remove_dir_all(&slot_dir);
+            return;
+        }
 
         let mut cmd = Command::new("lualatex");
-        cmd.current_dir(&self.fmt_dir)
-            .stdin(Stdio::null())
+        cmd.current_dir(&slot_dir)
+            .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            .args([
-                "-ini",
-                "-interaction=nonstopmode",
-                "-halt-on-error",
-                &format!("-jobname={}", fmt_name),
-                "&lualatex",
-                "mylatexformat.ltx",
-                &format!("{}.tex", fmt_name),
-            ]);
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
 
-        let output = timeout(Duration::from_secs(20), cmd.output())
-            .await
-            .map_err(|_| "Format build timed out".to_string())?
-            .map_err(|e| e.to_string())?;
+        apply_texinputs(&mut cmd, cfg.key.document_dir.as_deref());
 
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(String::from_utf8_lossy(&output.stdout).into_owned())
+        // ファイル引数を渡さずに起動することで、stdin がメイン入力ストリームとして待機状態になる
+        cmd.args([
+            "-jobname=out",
+            "-interaction=nonstopmode",
+            "-halt-on-error",
+            "-synctex=1",
+        ]);
+
+        let Ok(mut child) = cmd.spawn() else {
+            let _ = fs::remove_dir_all(&slot_dir);
+            return;
+        };
+
+        let Some(mut stdin) = child.stdin.take() else {
+            let _ = child.kill().await;
+            let _ = fs::remove_dir_all(&slot_dir);
+            return;
+        };
+        let Some(stdout) = child.stdout.take() else {
+            let _ = child.kill().await;
+            let _ = fs::remove_dir_all(&slot_dir);
+            return;
+        };
+
+        // プリアンブルを読み込ませてフラッシュ（stdin は閉じない）
+        if stdin.write_all(b"\\input{preamble_init.tex}\n").await.is_err()
+            || stdin.flush().await.is_err()
+        {
+            let _ = child.kill().await;
+            let _ = fs::remove_dir_all(&slot_dir);
+            return;
         }
+
+        // @@PREWARM_READY@@ が出力されるまで待機（メモリ展開完了の確認）
+        let mut reader = BufReader::new(stdout);
+        let ready = timeout(Duration::from_secs(30), async {
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) | Err(_) => return false,
+                    Ok(_) => {
+                        if line.contains(PREWARM_MARKER) {
+                            return true;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap_or(false);
+
+        if !ready || !matches!(child.try_wait(), Ok(None)) {
+            let _ = child.kill().await;
+            let _ = fs::remove_dir_all(&slot_dir);
+            return;
+        }
+
+        // 待機中にプリアンブルが変更・終了していなければプールへ登録
+        let still_valid = !self.is_shutting_down.load(Ordering::SeqCst)
+            && self
+                .config
+                .lock()
+                .await
+                .as_ref()
+                .map(|c| c.key == cfg.key)
+                .unwrap_or(false);
+
+        if still_valid {
+            let mut pool = self.idle_workers.lock().await;
+            if pool.len() < POOL_SIZE {
+                pool.push_back(PrewarmedWorker {
+                    child,
+                    stdin,
+                    stdout: reader,
+                    slot_dir,
+                    key: cfg.key,
+                });
+                return;
+            }
+        }
+
+        let _ = child.kill().await;
+        let _ = fs::remove_dir_all(&slot_dir);
     }
 }
 
-/// 編集中の .tex ファイルのディレクトリを TEXINPUTS へ設定（JPEG/PNG や \input を自動解決）
 fn apply_texinputs(cmd: &mut Command, document_dir: Option<&Path>) {
     if let Some(dir) = document_dir {
         let normalized = dir.to_string_lossy().replace('\\', "/");

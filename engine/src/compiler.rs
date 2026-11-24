@@ -14,6 +14,7 @@ use tokio::task::JoinSet;
 
 const MAX_CONCURRENT_WORKERS: usize = 4;
 
+/// 独立ブロック（preview環境）内で figure / table を安全に非フロート化するパッチ
 const NON_FLOAT_PATCH: &str = r#"
 \makeatletter
 \renewenvironment{figure}[1][]{%
@@ -122,15 +123,17 @@ impl EngineState {
             };
         }
 
+        // 1. 相互参照とカウンタ値を組版から独立して先行解決
         let xref = resolve_document_xref(&parsed.blocks);
         let xref_preload = xref.to_latex_preload();
 
+        // 2. プリアンブル分離とメモリ常駐プリウォームワーカー同期
         let (dumpable_preamble, deferred_preamble) = split_preamble_for_format(&parsed.preamble);
         let fmt_hash = compute_sha256(&dumpable_preamble);
 
         if self
             .worker_pool
-            .sync_format(&dumpable_preamble, &fmt_hash)
+            .sync_preamble(&dumpable_preamble, &fmt_hash, document_dir)
             .await
             .is_err()
         {
@@ -141,6 +144,7 @@ impl EngineState {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
 
+        // 3. カウンタ値・参照先番号・作業ディレクトリを織り込んだ実効キャッシュキーで判定
         let mut cache_hits = 0usize;
         let mut effective_keys: Vec<String> = Vec::with_capacity(parsed.blocks.len());
         let mut jobs: Vec<(String, String, String, String)> = Vec::new();
@@ -172,6 +176,7 @@ impl EngineState {
         }
         let cache_misses = jobs.len();
 
+        // 4. キャッシュミスした独立ブロックのみ並列コンパイル
         let mut join_set = JoinSet::new();
         let doc_dir_owned = document_dir.map(Path::to_path_buf);
 
@@ -222,6 +227,7 @@ impl EngineState {
             }
         }
 
+        // 5. 親文書の組み立てと SyncTeX インデックス更新
         let (master_body, source_map) = self.build_assembled_body(
             &deferred_preamble,
             &xref_preload,
@@ -259,13 +265,42 @@ impl EngineState {
         }
     }
 
+    /// 分割コンパイル非互換な複雑な文書を、メモリ常駐ワーカー優先で直接コンパイルする
     async fn compile_raw_fallback(
         &self,
         source: &str,
         document_dir: Option<&Path>,
         start: std::time::Instant,
     ) -> CompileResponse {
-        match self.worker_pool.run_raw_source(source, document_dir).await {
+        let job_result = if let Some(idx) = source.find("\\begin{document}") {
+            let raw_preamble = &source[..idx];
+            let raw_body = &source[idx..];
+            let (dumpable, deferred) = split_preamble_for_format(raw_preamble);
+            let p_hash = compute_sha256(&dumpable);
+
+            let warm_res = if self
+                .worker_pool
+                .sync_preamble(&dumpable, &p_hash, document_dir)
+                .await
+                .is_ok()
+            {
+                let body_with_deferred = format!("{}\n{}", deferred, raw_body);
+                self.worker_pool
+                    .run_job(&p_hash, &body_with_deferred, document_dir)
+                    .await
+            } else {
+                Err("prewarm sync failed".into())
+            };
+
+            match warm_res {
+                Ok(out) => Ok(out),
+                Err(_) => self.worker_pool.run_raw_source(source, document_dir).await,
+            }
+        } else {
+            self.worker_pool.run_raw_source(source, document_dir).await
+        };
+
+        match job_result {
             Ok(job_out) => {
                 *self.last_good_pdf.lock().unwrap() = Some(job_out.pdf_bytes.clone());
                 if let Some(gz) = job_out.synctex_gz {
@@ -285,7 +320,7 @@ impl EngineState {
                     cache_misses: 0,
                     resolved_labels_count: 0,
                     elapsed_ms: start.elapsed().as_millis(),
-                    mode: "raw_fallback".into(),
+                    mode: "raw_warm".into(),
                     error_detail: None,
                 }
             }
