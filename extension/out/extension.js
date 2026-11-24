@@ -44,9 +44,16 @@ let panel = null;
 let targetDocUri = null;
 let diagnostics;
 let debounceTimer;
+let fullSettleTimer;
 let syncTimer;
 let latestCompileSeq = 0;
+let inFlightCount = 0;
 let wasErrorState = false;
+let inTypingBurst = false;
+let lastPrepareTime = 0;
+let lastPreparedLine = 1;
+let lastCompileStartTime = 0;
+let needsFullPass = false;
 function activate(context) {
     diagnostics = vscode.languages.createDiagnosticCollection("realtime-tex");
     context.subscriptions.push(diagnostics);
@@ -57,23 +64,53 @@ function activate(context) {
             return;
         }
         targetDocUri = editor.document.uri;
+        const line = editor.selection.active.line + 1;
         ensureEngine(context);
         openOrRevealPanel(context, editor.document);
-        triggerCompile(editor.document);
+        triggerCompile(editor.document, line, false);
     });
     const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
-        if (!panel || !targetDocUri)
+        if (!panel || !targetDocUri || !engine)
             return;
         if (event.document.uri.toString() !== targetDocUri.toString())
             return;
+        if (event.contentChanges.length === 0)
+            return;
+        const now = Date.now();
+        const cursorLine = getCurrentCursorLine(event.document, event.contentChanges[0].range.start.line + 1);
+        const docDir = event.document.isUntitled ? undefined : path.dirname(event.document.uri.fsPath);
+        // 1. 入力開始 0ms トリガー：1文字目を打った瞬間にカーソル手前までの先行組版をスタート
+        if (!inTypingBurst ||
+            Math.abs(cursorLine - lastPreparedLine) > 15 ||
+            now - lastPrepareTime > 2500) {
+            inTypingBurst = true;
+            lastPrepareTime = now;
+            lastPreparedLine = cursorLine;
+            engine.prepare(event.document.getText(), cursorLine, docDir);
+            panel.webview.postMessage({ type: "staging" });
+        }
+        // 2. 入力最中のライブ更新（手を止めずに打ち続けていても約850msごとに途中経過をプレビュー反映）
+        if (inFlightCount === 0 && now - lastCompileStartTime >= 850) {
+            triggerCompile(event.document, cursorLine, true);
+        }
+        // 3. 区切り文字・短い息継ぎでの高速更新
         if (debounceTimer)
             clearTimeout(debounceTimer);
         const lastChange = event.contentChanges[event.contentChanges.length - 1]?.text ?? "";
         const isBoundary = /[\n}\]$。．.、,]$/.test(lastChange);
-        const delay = wasErrorState || isBoundary ? 80 : 180;
+        const delay = wasErrorState || isBoundary ? 70 : 180;
         debounceTimer = setTimeout(() => {
-            triggerCompile(event.document);
+            triggerCompile(event.document, cursorLine, true);
         }, delay);
+        // 4. 入力が完全に落ち着いた 700ms 後：部分ドラフトだった場合のみ裏で全文を静かに同期
+        if (fullSettleTimer)
+            clearTimeout(fullSettleTimer);
+        fullSettleTimer = setTimeout(() => {
+            inTypingBurst = false;
+            if (needsFullPass) {
+                triggerCompile(event.document, cursorLine, false);
+            }
+        }, 700);
     });
     const activeEditorListener = vscode.window.onDidChangeActiveTextEditor((editor) => {
         if (!panel || !editor)
@@ -82,7 +119,8 @@ function activate(context) {
             if (targetDocUri?.toString() !== editor.document.uri.toString()) {
                 targetDocUri = editor.document.uri;
                 panel.title = `Preview: ${path.basename(editor.document.fileName)}`;
-                triggerCompile(editor.document);
+                const line = editor.selection.active.line + 1;
+                triggerCompile(editor.document, line, false);
             }
         }
     });
@@ -94,6 +132,14 @@ function activate(context) {
         if (syncTimer)
             clearTimeout(syncTimer);
         const line = event.selections[0].active.line + 1;
+        // カーソルを大きく移動した時点でも先行ステージングを準備しておく
+        if (!inTypingBurst && Math.abs(line - lastPreparedLine) > 20) {
+            lastPreparedLine = line;
+            lastPrepareTime = Date.now();
+            const doc = event.textEditor.document;
+            const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
+            engine.prepare(doc.getText(), line, docDir);
+        }
         syncTimer = setTimeout(async () => {
             const target = await engine?.syncToPdf(line);
             if (target && panel) {
@@ -106,6 +152,13 @@ function activate(context) {
 function deactivate() {
     engine?.dispose();
     engine = null;
+}
+function getCurrentCursorLine(doc, fallbackLine) {
+    const editor = vscode.window.activeTextEditor;
+    if (editor && editor.document.uri.toString() === doc.uri.toString()) {
+        return editor.selection.active.line + 1;
+    }
+    return fallbackLine;
 }
 function ensureEngine(context) {
     if (engine)
@@ -122,7 +175,6 @@ function openOrRevealPanel(context, doc) {
         return;
     }
     const pdfjsBuildDir = vscode.Uri.joinPath(context.extensionUri, "node_modules", "pdfjs-dist", "build");
-    // Rust エンジンが生成する一時 PDF フォルダを Webview から直接参照できるように許可
     const previewOutDir = vscode.Uri.file(path.join(os.tmpdir(), "realtime_tex_vscode_engine", "preview_out"));
     panel = vscode.window.createWebviewPanel("realtimeTexPreview", `Preview: ${path.basename(doc.fileName)}`, { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, {
         enableScripts: true,
@@ -137,24 +189,36 @@ function openOrRevealPanel(context, doc) {
         targetDocUri = null;
     });
 }
-async function triggerCompile(doc) {
+async function triggerCompile(doc, line, draft) {
     if (!engine || !panel)
         return;
     const mySeq = ++latestCompileSeq;
+    lastCompileStartTime = Date.now();
+    inFlightCount++;
     panel.webview.postMessage({ type: "compiling" });
     try {
         const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
-        const res = await engine.compile(doc.getText(), docDir);
-        if (res.status === "cancelled" || mySeq !== latestCompileSeq || !panel) {
+        const res = await engine.compile(doc.getText(), line, draft, docDir);
+        if (res.status === "cancelled" || !panel) {
             return;
         }
         if (res.status === "updated" && res.pdf_path) {
             wasErrorState = false;
             diagnostics.delete(doc.uri);
+            const isDraft = res.mode === "draft_partial";
+            needsFullPass = isDraft;
             const pdfUri = panel.webview.asWebviewUri(vscode.Uri.file(res.pdf_path)).toString();
-            panel.webview.postMessage({ type: "render", result: res, pdfUri });
+            panel.webview.postMessage({ type: "render", result: res, pdfUri, isDraft });
+            // 既にタイピングが止まった後に draft_partial が完了した場合、引き続いて全文同期を実行
+            if (isDraft && !inTypingBurst && mySeq === latestCompileSeq) {
+                if (fullSettleTimer)
+                    clearTimeout(fullSettleTimer);
+                fullSettleTimer = setTimeout(() => {
+                    triggerCompile(doc, line, false);
+                }, 350);
+            }
         }
-        else {
+        else if (mySeq === latestCompileSeq) {
             wasErrorState = true;
             publishDiagnostics(doc, res);
             panel.webview.postMessage({ type: "error", result: res });
@@ -164,6 +228,9 @@ async function triggerCompile(doc) {
         if (mySeq === latestCompileSeq) {
             vscode.window.showErrorMessage(`Realtime TeX Engine Error: ${String(err)}`);
         }
+    }
+    finally {
+        inFlightCount = Math.max(0, inFlightCount - 1);
     }
 }
 function publishDiagnostics(doc, res) {
@@ -227,6 +294,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       color: #fff;
     }
     .badge[data-state="ok"] { background: #2e7d32; }
+    .badge[data-state="staging"] { background: #0284c7; }
     .badge[data-state="compiling"] { background: #d97706; }
     .badge[data-state="error"] { background: #c62828; }
     .metrics {
@@ -306,7 +374,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
 
     let renderGeneration = 0;
 
-    function ensurePageSlots(numPages) {
+    function ensurePageSlots(numPages, isDraft) {
       const existing = previewEl.querySelectorAll(".pdf-page-wrap");
       for (let i = existing.length; i < numPages; i++) {
         const wrap = document.createElement("div");
@@ -316,8 +384,11 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
         wrap.appendChild(canvas);
         previewEl.appendChild(wrap);
       }
-      for (let i = existing.length - 1; i >= numPages; i--) {
-        existing[i].remove();
+      // 部分ドラフト更新中は後ろのページCanvasを消さずに維持し、スクロール飛びを防ぐ
+      if (!isDraft) {
+        for (let i = existing.length - 1; i >= numPages; i--) {
+          existing[i].remove();
+        }
       }
     }
 
@@ -371,7 +442,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       ctx.drawImage(offscreen, 0, 0);
     }
 
-    async function renderPdfFromUri(pdfUri) {
+    async function renderPdfFromUri(pdfUri, isDraft) {
       const gen = ++renderGeneration;
       const resp = await fetch(pdfUri);
       const buf = await resp.arrayBuffer();
@@ -380,7 +451,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
       if (gen !== renderGeneration) return;
 
-      ensurePageSlots(pdf.numPages);
+      ensurePageSlots(pdf.numPages, isDraft);
       const { visible, others } = getPrioritizedPages(pdf.numPages);
 
       await Promise.all(visible.map((p) => renderSinglePage(pdf, p, gen)));
@@ -419,7 +490,10 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
 
     window.addEventListener("message", async (event) => {
       const msg = event.data;
-      if (msg.type === "compiling") {
+      if (msg.type === "staging") {
+        statusEl.textContent = "Pre-compiling...";
+        statusEl.dataset.state = "staging";
+      } else if (msg.type === "compiling") {
         statusEl.textContent = "Compiling...";
         statusEl.dataset.state = "compiling";
       } else if (msg.type === "render") {
@@ -430,8 +504,8 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
         mTime.textContent = r.elapsed_ms + " ms";
         errorBar.classList.remove("visible");
 
-        await renderPdfFromUri(msg.pdfUri);
-        statusEl.textContent = "Synced";
+        await renderPdfFromUri(msg.pdfUri, Boolean(msg.isDraft));
+        statusEl.textContent = msg.isDraft ? "Live Draft" : "Synced";
         statusEl.dataset.state = "ok";
       } else if (msg.type === "error") {
         const r = msg.result;

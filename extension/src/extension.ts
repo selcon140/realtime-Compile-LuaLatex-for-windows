@@ -9,9 +9,16 @@ let targetDocUri: vscode.Uri | null = null;
 let diagnostics: vscode.DiagnosticCollection;
 
 let debounceTimer: NodeJS.Timeout | undefined;
+let fullSettleTimer: NodeJS.Timeout | undefined;
 let syncTimer: NodeJS.Timeout | undefined;
+
 let latestCompileSeq = 0;
+let inFlightCount = 0;
 let wasErrorState = false;
+let inTypingBurst = false;
+let lastPrepareTime = 0;
+let lastPreparedLine = 1;
+let lastCompileStartTime = 0;
 
 export function activate(context: vscode.ExtensionContext) {
   diagnostics = vscode.languages.createDiagnosticCollection("realtime-tex");
@@ -25,33 +32,96 @@ export function activate(context: vscode.ExtensionContext) {
     }
 
     targetDocUri = editor.document.uri;
+    const line = editor.selection.active.line + 1;
     ensureEngine(context);
     openOrRevealPanel(context, editor.document);
-    triggerCompile(editor.document);
+    triggerCompile(editor.document, line, false);
   });
 
   const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
-    if (!panel || !targetDocUri) return;
-    if (event.document.uri.toString() !== targetDocUri.toString()) return;
+  const doc = event.document;
+  if (!engine || !isTarget(doc) || event.contentChanges.length === 0) {
+    return;
+  }
 
-    if (debounceTimer) clearTimeout(debounceTimer);
+  const t = nowMs();
+  const version = doc.version;
+  const mySession = session;
+  const line = getCurrentCursorLine(
+    doc,
+    event.contentChanges[0].range.start.line + 1
+  );
 
-    const lastChange = event.contentChanges[event.contentChanges.length - 1]?.text ?? "";
-    const isBoundary = /[\n}\]$。．.、,]$/.test(lastChange);
-    const delay = wasErrorState || isBoundary ? 80 : 180;
+  lastEdit = {
+    uri: doc.uri.toString(),
+    version,
+    at: t,
+  };
 
-    debounceTimer = setTimeout(() => {
-      triggerCompile(event.document);
-    }, delay);
-  });
+  // 古い版向けのタイマーを先に取り消す
+  clearTimeout(debounceTimer);
+  clearTimeout(fullSettleTimer);
+
+  const firstInBurst = !inTypingBurst;
+  inTypingBurst = true;
+
+  // 先行組版は従来どおり、入力開始時点で発火
+  if (
+    firstInBurst ||
+    Math.abs(line - lastPreparedLine) > 15 ||
+    t - lastPrepareTime > 2500
+  ) {
+    lastPrepareTime = t;
+    lastPreparedLine = line;
+
+    const dir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
+    engine.prepare(doc.getText(), line, dir);
+    void panel?.webview.postMessage({ type: "staging" });
+  }
+
+  const sendDraft = () => {
+    if (session !== mySession || !isTarget(doc) || doc.version !== version) {
+      return;
+    }
+    void triggerCompile(doc, line, true);
+  };
+
+  // 【重要】即時送信と遅延送信は排他。同じ編集で両方を実行しない
+  if (
+    inFlightCount === 0 &&
+    (firstInBurst || t - lastCompileStartTime >= 850)
+  ) {
+    sendDraft();
+  } else {
+    const lastChange = event.contentChanges[event.contentChanges.length - 1].text;
+    const boundary = /[\n}\]$。．.、,]$/.test(lastChange);
+    debounceTimer = setTimeout(sendDraft, wasErrorState || boundary ? 70 : 180);
+  }
+
+  // 全文同期は「実際に部分PDFだった場合」だけ。
+  // 700msを過ぎてからドラフトが返る場合は triggerCompile 側が処理する。
+  fullSettleTimer = setTimeout(() => {
+    if (session !== mySession || !isTarget(doc) || doc.version !== version) {
+      return;
+    }
+
+    inTypingBurst = false;
+
+    if (partialVersion === version) {
+      void triggerCompile(doc, line, false);
+    }
+  }, 700);
+});
 
   const activeEditorListener = vscode.window.onDidChangeActiveTextEditor((editor) => {
     if (!panel || !editor) return;
     if (editor.document.fileName.endsWith(".tex")) {
       if (targetDocUri?.toString() !== editor.document.uri.toString()) {
+        resetPreviewSession();
         targetDocUri = editor.document.uri;
         panel.title = `Preview: ${path.basename(editor.document.fileName)}`;
-        triggerCompile(editor.document);
+        const line = editor.selection.active.line + 1;
+        triggerCompile(editor.document, line, false);
       }
     }
   });
@@ -62,6 +132,16 @@ export function activate(context: vscode.ExtensionContext) {
 
     if (syncTimer) clearTimeout(syncTimer);
     const line = event.selections[0].active.line + 1;
+
+    // カーソルを大きく移動した時点でも先行ステージングを準備しておく
+    if (!inTypingBurst && Math.abs(line - lastPreparedLine) > 20) {
+      lastPreparedLine = line;
+      lastPrepareTime = Date.now();
+      const doc = event.textEditor.document;
+      const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
+      engine.prepare(doc.getText(), line, docDir);
+    }
+
     syncTimer = setTimeout(async () => {
       const target = await engine?.syncToPdf(line);
       if (target && panel) {
@@ -76,6 +156,14 @@ export function activate(context: vscode.ExtensionContext) {
 export function deactivate() {
   engine?.dispose();
   engine = null;
+}
+
+function getCurrentCursorLine(doc: vscode.TextDocument, fallbackLine: number): number {
+  const editor = vscode.window.activeTextEditor;
+  if (editor && editor.document.uri.toString() === doc.uri.toString()) {
+    return editor.selection.active.line + 1;
+  }
+  return fallbackLine;
 }
 
 function ensureEngine(context: vscode.ExtensionContext) {
@@ -99,7 +187,6 @@ function openOrRevealPanel(context: vscode.ExtensionContext, doc: vscode.TextDoc
     "pdfjs-dist",
     "build"
   );
-  // Rust エンジンが生成する一時 PDF フォルダを Webview から直接参照できるように許可
   const previewOutDir = vscode.Uri.file(
     path.join(os.tmpdir(), "realtime_tex_vscode_engine", "preview_out")
   );
@@ -130,33 +217,114 @@ function openOrRevealPanel(context: vscode.ExtensionContext, doc: vscode.TextDoc
   });
 }
 
-async function triggerCompile(doc: vscode.TextDocument) {
-  if (!engine || !panel) return;
+async function triggerCompile(
+  doc: vscode.TextDocument,
+  line: number,
+  draft: boolean
+): Promise<void> {
+  if (!engine || !panel || !isTarget(doc)) return;
 
-  const mySeq = ++latestCompileSeq;
-  panel.webview.postMessage({ type: "compiling" });
+  const version = doc.version;
+  const uri = doc.uri.toString();
+  const mySession = session;
+
+  // await より前に記録することが重要。
+  // 同じ版の全文をすでに要求した後、ドラフトに戻ることも防ぐ。
+  if (draft) {
+    if (draftSentVersion === version || fullSentVersion === version) return;
+    draftSentVersion = version;
+  } else {
+    if (fullSentVersion === version) return;
+    fullSentVersion = version;
+  }
+
+  const seq = ++latestCompileSeq;
+  const editAt =
+    lastEdit?.uri === uri && lastEdit.version === version
+      ? lastEdit.at
+      : undefined;
+
+  const sentAt = nowMs();
+  lastCompileStartTime = sentAt;
+  inFlightCount++;
+
+  void panel.webview.postMessage({ type: "compiling" });
 
   try {
-    const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
-    const res: CompileResult = await engine.compile(doc.getText(), docDir);
+    const dir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
+    const res: CompileResult = await engine.compile(doc.getText(), line, draft, dir);
+    const receivedAt = nowMs();
 
-    if (res.status === "cancelled" || mySeq !== latestCompileSeq || !panel) {
+    if (
+      res.status === "cancelled" ||
+      session !== mySession ||
+      !panel ||
+      !isTarget(doc)
+    ) {
       return;
     }
 
+    // 旧版でも成功した途中経過は表示できるようにする。
+    // ただし、さらに新しい結果の表示後に古い結果で巻き戻さない。
+    // 現在のRust側は実行1件＋待機最新1件で、結果は実行順に返る。
+    const currentVersion = doc.version === version;
+
     if (res.status === "updated" && res.pdf_path) {
-      wasErrorState = false;
-      diagnostics.delete(doc.uri);
-      const pdfUri = panel.webview.asWebviewUri(vscode.Uri.file(res.pdf_path)).toString();
-      panel.webview.postMessage({ type: "render", result: res, pdfUri });
-    } else {
+      const isDraft = res.mode === "draft_partial";
+
+      if (currentVersion) {
+        wasErrorState = false;
+        diagnostics.delete(doc.uri);
+        partialVersion = isDraft ? version : -1;
+      }
+
+      const pdfUri = panel.webview
+        .asWebviewUri(vscode.Uri.file(res.pdf_path))
+        .toString();
+
+      paintTraces.set(seq, {
+        session: mySession,
+        uri,
+        version,
+        editAt,
+        sentAt,
+        receivedAt,
+        engineMs: res.elapsed_ms,
+      });
+
+      // 非表示・描画キャンセルなどで応答が来ない分を無制限に残さない
+      while (paintTraces.size > 32) {
+        const first = paintTraces.keys().next();
+        if (first.done) break;
+        paintTraces.delete(first.value);
+      }
+
+      void panel.webview.postMessage({
+        type: "render",
+        result: res,
+        pdfUri,
+        isDraft,
+        seq,
+        version,
+      });
+
+      // ドラフトの完成が700msタイマーより遅かった場合。
+      // 同じ版の full が送信済みなら関数先頭で止まる。
+      if (currentVersion && isDraft && !inTypingBurst) {
+        void triggerCompile(doc, line, false);
+      }
+    } else if (currentVersion && seq === latestCompileSeq) {
       wasErrorState = true;
       publishDiagnostics(doc, res);
-      panel.webview.postMessage({ type: "error", result: res });
+      void panel.webview.postMessage({ type: "error", result: res });
     }
   } catch (err) {
-    if (mySeq === latestCompileSeq) {
-      vscode.window.showErrorMessage(`Realtime TeX Engine Error: ${String(err)}`);
+    if (session === mySession && seq === latestCompileSeq) {
+      void vscode.window.showErrorMessage(`Realtime TeX Engine Error: ${String(err)}`);
+    }
+  } finally {
+    if (session === mySession) {
+      inFlightCount = Math.max(0, inFlightCount - 1);
     }
   }
 }
@@ -237,6 +405,7 @@ function getWebviewHtml(
       color: #fff;
     }
     .badge[data-state="ok"] { background: #2e7d32; }
+    .badge[data-state="staging"] { background: #0284c7; }
     .badge[data-state="compiling"] { background: #d97706; }
     .badge[data-state="error"] { background: #c62828; }
     .metrics {
@@ -316,7 +485,7 @@ function getWebviewHtml(
 
     let renderGeneration = 0;
 
-    function ensurePageSlots(numPages) {
+    function ensurePageSlots(numPages, isDraft) {
       const existing = previewEl.querySelectorAll(".pdf-page-wrap");
       for (let i = existing.length; i < numPages; i++) {
         const wrap = document.createElement("div");
@@ -326,8 +495,11 @@ function getWebviewHtml(
         wrap.appendChild(canvas);
         previewEl.appendChild(wrap);
       }
-      for (let i = existing.length - 1; i >= numPages; i--) {
-        existing[i].remove();
+      // 部分ドラフト更新中は後ろのページCanvasを消さずに維持し、スクロール飛びを防ぐ
+      if (!isDraft) {
+        for (let i = existing.length - 1; i >= numPages; i--) {
+          existing[i].remove();
+        }
       }
     }
 
@@ -381,7 +553,7 @@ function getWebviewHtml(
       ctx.drawImage(offscreen, 0, 0);
     }
 
-    async function renderPdfFromUri(pdfUri) {
+    async function renderPdfFromUri(pdfUri, isDraft) {
       const gen = ++renderGeneration;
       const resp = await fetch(pdfUri);
       const buf = await resp.arrayBuffer();
@@ -390,7 +562,7 @@ function getWebviewHtml(
       const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
       if (gen !== renderGeneration) return;
 
-      ensurePageSlots(pdf.numPages);
+      ensurePageSlots(pdf.numPages, isDraft);
       const { visible, others } = getPrioritizedPages(pdf.numPages);
 
       await Promise.all(visible.map((p) => renderSinglePage(pdf, p, gen)));
@@ -429,7 +601,10 @@ function getWebviewHtml(
 
     window.addEventListener("message", async (event) => {
       const msg = event.data;
-      if (msg.type === "compiling") {
+      if (msg.type === "staging") {
+        statusEl.textContent = "Pre-compiling...";
+        statusEl.dataset.state = "staging";
+      } else if (msg.type === "compiling") {
         statusEl.textContent = "Compiling...";
         statusEl.dataset.state = "compiling";
       } else if (msg.type === "render") {
@@ -440,8 +615,8 @@ function getWebviewHtml(
         mTime.textContent = r.elapsed_ms + " ms";
         errorBar.classList.remove("visible");
 
-        await renderPdfFromUri(msg.pdfUri);
-        statusEl.textContent = "Synced";
+        await renderPdfFromUri(msg.pdfUri, Boolean(msg.isDraft));
+        statusEl.textContent = msg.isDraft ? "Live Draft" : "Synced";
         statusEl.dataset.state = "ok";
       } else if (msg.type === "error") {
         const r = msg.result;

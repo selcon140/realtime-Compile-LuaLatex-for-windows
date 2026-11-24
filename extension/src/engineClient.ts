@@ -40,7 +40,8 @@ export class EngineClient {
     if (customPath && fs.existsSync(customPath)) {
       return customPath;
     }
-    const exeName = process.platform === "win32" ? "realtime-tex-server.exe" : "realtime-tex-server";
+    const exeName =
+      process.platform === "win32" ? "realtime-tex-server.exe" : "realtime-tex-server";
     const candidates = [
       path.resolve(extensionPath, "..", "engine", "target", "release", exeName),
       path.resolve(extensionPath, "..", "engine", "target", "debug", exeName),
@@ -91,13 +92,33 @@ export class EngineClient {
     });
   }
 
-  async compile(source: string, documentDir?: string): Promise<CompileResult> {
+  /** 入力開始の瞬間（0ms）に呼び出し、カーソル手前までの先行組版を開始させる */
+  prepare(source: string, line: number, documentDir?: string): void {
+    this.start();
+    if (!this.proc) return;
+    const payload = {
+      type: "prepare",
+      source,
+      line,
+      document_dir: documentDir ?? null,
+    };
+    this.proc.stdin.write(JSON.stringify(payload) + "\n");
+  }
+
+  async compile(
+    source: string,
+    line: number,
+    draft: boolean,
+    documentDir?: string
+  ): Promise<CompileResult> {
     this.start();
     const id = this.nextId++;
     const payload = {
       type: "compile",
       id,
       source,
+      line,
+      draft,
       document_dir: documentDir ?? null,
     };
     const resp = await this.send(id, payload);

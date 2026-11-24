@@ -95,13 +95,28 @@ class EngineClient {
             this.pending.clear();
         });
     }
-    async compile(source, documentDir) {
+    /** 入力開始の瞬間（0ms）に呼び出し、カーソル手前までの先行組版を開始させる */
+    prepare(source, line, documentDir) {
+        this.start();
+        if (!this.proc)
+            return;
+        const payload = {
+            type: "prepare",
+            source,
+            line,
+            document_dir: documentDir ?? null,
+        };
+        this.proc.stdin.write(JSON.stringify(payload) + "\n");
+    }
+    async compile(source, line, draft, documentDir) {
         this.start();
         const id = this.nextId++;
         const payload = {
             type: "compile",
             id,
             source,
+            line,
+            draft,
             document_dir: documentDir ?? null,
         };
         const resp = await this.send(id, payload);
