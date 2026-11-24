@@ -1,3 +1,4 @@
+import * as os from "os";
 import * as path from "path";
 import * as vscode from "vscode";
 import { CompileResult, EngineClient } from "./engineClient";
@@ -29,7 +30,6 @@ export function activate(context: vscode.ExtensionContext) {
     triggerCompile(editor.document);
   });
 
-  // 未保存バッファの編集を適応型デバウンスでリアルタイムフック
   const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
     if (!panel || !targetDocUri) return;
     if (event.document.uri.toString() !== targetDocUri.toString()) return;
@@ -56,7 +56,6 @@ export function activate(context: vscode.ExtensionContext) {
     }
   });
 
-  // SyncTeX 追従（20ms デバウンスで高応答化）
   const selectionListener = vscode.window.onDidChangeTextEditorSelection((event) => {
     if (!panel || !targetDocUri || !engine) return;
     if (event.textEditor.document.uri.toString() !== targetDocUri.toString()) return;
@@ -100,6 +99,10 @@ function openOrRevealPanel(context: vscode.ExtensionContext, doc: vscode.TextDoc
     "pdfjs-dist",
     "build"
   );
+  // Rust エンジンが生成する一時 PDF フォルダを Webview から直接参照できるように許可
+  const previewOutDir = vscode.Uri.file(
+    path.join(os.tmpdir(), "realtime_tex_vscode_engine", "preview_out")
+  );
 
   panel = vscode.window.createWebviewPanel(
     "realtimeTexPreview",
@@ -108,7 +111,7 @@ function openOrRevealPanel(context: vscode.ExtensionContext, doc: vscode.TextDoc
     {
       enableScripts: true,
       retainContextWhenHidden: true,
-      localResourceRoots: [pdfjsBuildDir],
+      localResourceRoots: [pdfjsBuildDir, previewOutDir],
     }
   );
 
@@ -135,18 +138,17 @@ async function triggerCompile(doc: vscode.TextDocument) {
 
   try {
     const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
-    // 進行中の古いジョブは Rust 側で自動 abort されるため、待たずに即送信する
     const res: CompileResult = await engine.compile(doc.getText(), docDir);
 
-    // キャンセル済み、または既に新しいリクエストが走っている場合は無視
     if (res.status === "cancelled" || mySeq !== latestCompileSeq || !panel) {
       return;
     }
 
-    if (res.status === "updated" && res.pdf_base64) {
+    if (res.status === "updated" && res.pdf_path) {
       wasErrorState = false;
       diagnostics.delete(doc.uri);
-      panel.webview.postMessage({ type: "render", result: res });
+      const pdfUri = panel.webview.asWebviewUri(vscode.Uri.file(res.pdf_path)).toString();
+      panel.webview.postMessage({ type: "render", result: res, pdfUri });
     } else {
       wasErrorState = true;
       publishDiagnostics(doc, res);
@@ -314,14 +316,6 @@ function getWebviewHtml(
 
     let renderGeneration = 0;
 
-    function base64ToUint8Array(b64) {
-      const bin = atob(b64);
-      const len = bin.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-      return bytes;
-    }
-
     function ensurePageSlots(numPages) {
       const existing = previewEl.querySelectorAll(".pdf-page-wrap");
       for (let i = existing.length; i < numPages; i++) {
@@ -337,7 +331,6 @@ function getWebviewHtml(
       }
     }
 
-    // 現在のスクロール位置に表示されているページを最優先で並べる
     function getPrioritizedPages(numPages) {
       const viewTop = previewEl.scrollTop;
       const viewBottom = viewTop + previewEl.clientHeight;
@@ -388,19 +381,21 @@ function getWebviewHtml(
       ctx.drawImage(offscreen, 0, 0);
     }
 
-    async function renderPdfPrioritized(data) {
+    async function renderPdfFromUri(pdfUri) {
       const gen = ++renderGeneration;
-      const pdf = await pdfjsLib.getDocument({ data }).promise;
+      const resp = await fetch(pdfUri);
+      const buf = await resp.arrayBuffer();
+      if (gen !== renderGeneration) return;
+
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
       if (gen !== renderGeneration) return;
 
       ensurePageSlots(pdf.numPages);
       const { visible, others } = getPrioritizedPages(pdf.numPages);
 
-      // 1. 可視ページを並列で最優先描画（体感レイテンシを最小化）
       await Promise.all(visible.map((p) => renderSinglePage(pdf, p, gen)));
       if (gen !== renderGeneration) return;
 
-      // 2. 画面外の残ページはバックグラウンドで順次描画
       for (const p of others) {
         if (gen !== renderGeneration) return;
         await new Promise((r) => setTimeout(r, 0));
@@ -415,7 +410,6 @@ function getWebviewHtml(
       const desired = Math.max(0, wrap.offsetTop + yPx - previewEl.clientHeight * 0.35);
       const dist = Math.abs(previewEl.scrollTop - desired);
 
-      // 近距離移動はアニメーションなしで即時追従
       previewEl.scrollTo({
         top: desired,
         behavior: dist < 240 ? "auto" : "smooth",
@@ -446,7 +440,7 @@ function getWebviewHtml(
         mTime.textContent = r.elapsed_ms + " ms";
         errorBar.classList.remove("visible");
 
-        await renderPdfPrioritized(base64ToUint8Array(r.pdf_base64));
+        await renderPdfFromUri(msg.pdfUri);
         statusEl.textContent = "Synced";
         statusEl.dataset.state = "ok";
       } else if (msg.type === "error") {

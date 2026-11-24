@@ -1,7 +1,5 @@
-use flate2::read::GzDecoder;
 use serde::Serialize;
 use std::collections::BTreeMap;
-use std::io::Read;
 
 const SP_PER_BP: f64 = 65536.0 * (72.27 / 72.0);
 
@@ -20,7 +18,6 @@ pub struct SourceMap {
 }
 
 impl SourceMap {
-    /// 生ソース直接コンパイル用（1対1の恒等マッピング）
     pub fn identity(total_lines: usize) -> Self {
         Self {
             mappings: vec![LineMapping {
@@ -64,13 +61,8 @@ pub struct SyncTexIndex {
 }
 
 impl SyncTexIndex {
-    pub fn parse_gz(gz_bytes: &[u8], source_map: SourceMap) -> Result<Self, String> {
-        let mut decoder = GzDecoder::new(gz_bytes);
-        let mut content = String::new();
-        decoder
-            .read_to_string(&mut content)
-            .map_err(|e| format!("Failed to decompress synctex.gz: {}", e))?;
-
+    /// 非圧縮 .synctex テキストを解凍なしで直接パース
+    pub fn parse_raw(content: &str, source_map: SourceMap) -> Self {
         let mut job_tag: Option<usize> = None;
         let mut current_page: usize = 0;
         let mut line_to_pos: BTreeMap<usize, PdfSyncTarget> = BTreeMap::new();
@@ -124,10 +116,10 @@ impl SyncTexIndex {
             }
         }
 
-        Ok(Self {
+        Self {
             line_to_pos,
             source_map,
-        })
+        }
     }
 
     pub fn lookup_editor_line(&self, editor_line: usize) -> Option<PdfSyncTarget> {

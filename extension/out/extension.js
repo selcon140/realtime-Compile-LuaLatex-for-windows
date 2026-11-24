@@ -35,6 +35,7 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.activate = activate;
 exports.deactivate = deactivate;
+const os = __importStar(require("os"));
 const path = __importStar(require("path"));
 const vscode = __importStar(require("vscode"));
 const engineClient_1 = require("./engineClient");
@@ -60,7 +61,6 @@ function activate(context) {
         openOrRevealPanel(context, editor.document);
         triggerCompile(editor.document);
     });
-    // 未保存バッファの編集を適応型デバウンスでリアルタイムフック
     const changeListener = vscode.workspace.onDidChangeTextDocument((event) => {
         if (!panel || !targetDocUri)
             return;
@@ -86,7 +86,6 @@ function activate(context) {
             }
         }
     });
-    // SyncTeX 追従（20ms デバウンスで高応答化）
     const selectionListener = vscode.window.onDidChangeTextEditorSelection((event) => {
         if (!panel || !targetDocUri || !engine)
             return;
@@ -123,10 +122,12 @@ function openOrRevealPanel(context, doc) {
         return;
     }
     const pdfjsBuildDir = vscode.Uri.joinPath(context.extensionUri, "node_modules", "pdfjs-dist", "build");
+    // Rust エンジンが生成する一時 PDF フォルダを Webview から直接参照できるように許可
+    const previewOutDir = vscode.Uri.file(path.join(os.tmpdir(), "realtime_tex_vscode_engine", "preview_out"));
     panel = vscode.window.createWebviewPanel("realtimeTexPreview", `Preview: ${path.basename(doc.fileName)}`, { viewColumn: vscode.ViewColumn.Beside, preserveFocus: true }, {
         enableScripts: true,
         retainContextWhenHidden: true,
-        localResourceRoots: [pdfjsBuildDir],
+        localResourceRoots: [pdfjsBuildDir, previewOutDir],
     });
     const pdfjsUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(pdfjsBuildDir, "pdf.min.mjs"));
     const pdfWorkerUri = panel.webview.asWebviewUri(vscode.Uri.joinPath(pdfjsBuildDir, "pdf.worker.min.mjs"));
@@ -143,16 +144,15 @@ async function triggerCompile(doc) {
     panel.webview.postMessage({ type: "compiling" });
     try {
         const docDir = doc.isUntitled ? undefined : path.dirname(doc.uri.fsPath);
-        // 進行中の古いジョブは Rust 側で自動 abort されるため、待たずに即送信する
         const res = await engine.compile(doc.getText(), docDir);
-        // キャンセル済み、または既に新しいリクエストが走っている場合は無視
         if (res.status === "cancelled" || mySeq !== latestCompileSeq || !panel) {
             return;
         }
-        if (res.status === "updated" && res.pdf_base64) {
+        if (res.status === "updated" && res.pdf_path) {
             wasErrorState = false;
             diagnostics.delete(doc.uri);
-            panel.webview.postMessage({ type: "render", result: res });
+            const pdfUri = panel.webview.asWebviewUri(vscode.Uri.file(res.pdf_path)).toString();
+            panel.webview.postMessage({ type: "render", result: res, pdfUri });
         }
         else {
             wasErrorState = true;
@@ -306,14 +306,6 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
 
     let renderGeneration = 0;
 
-    function base64ToUint8Array(b64) {
-      const bin = atob(b64);
-      const len = bin.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) bytes[i] = bin.charCodeAt(i);
-      return bytes;
-    }
-
     function ensurePageSlots(numPages) {
       const existing = previewEl.querySelectorAll(".pdf-page-wrap");
       for (let i = existing.length; i < numPages; i++) {
@@ -329,7 +321,6 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       }
     }
 
-    // 現在のスクロール位置に表示されているページを最優先で並べる
     function getPrioritizedPages(numPages) {
       const viewTop = previewEl.scrollTop;
       const viewBottom = viewTop + previewEl.clientHeight;
@@ -380,19 +371,21 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       ctx.drawImage(offscreen, 0, 0);
     }
 
-    async function renderPdfPrioritized(data) {
+    async function renderPdfFromUri(pdfUri) {
       const gen = ++renderGeneration;
-      const pdf = await pdfjsLib.getDocument({ data }).promise;
+      const resp = await fetch(pdfUri);
+      const buf = await resp.arrayBuffer();
+      if (gen !== renderGeneration) return;
+
+      const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(buf) }).promise;
       if (gen !== renderGeneration) return;
 
       ensurePageSlots(pdf.numPages);
       const { visible, others } = getPrioritizedPages(pdf.numPages);
 
-      // 1. 可視ページを並列で最優先描画（体感レイテンシを最小化）
       await Promise.all(visible.map((p) => renderSinglePage(pdf, p, gen)));
       if (gen !== renderGeneration) return;
 
-      // 2. 画面外の残ページはバックグラウンドで順次描画
       for (const p of others) {
         if (gen !== renderGeneration) return;
         await new Promise((r) => setTimeout(r, 0));
@@ -407,7 +400,6 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
       const desired = Math.max(0, wrap.offsetTop + yPx - previewEl.clientHeight * 0.35);
       const dist = Math.abs(previewEl.scrollTop - desired);
 
-      // 近距離移動はアニメーションなしで即時追従
       previewEl.scrollTo({
         top: desired,
         behavior: dist < 240 ? "auto" : "smooth",
@@ -438,7 +430,7 @@ function getWebviewHtml(webview, pdfjsUri, pdfWorkerUri) {
         mTime.textContent = r.elapsed_ms + " ms";
         errorBar.classList.remove("visible");
 
-        await renderPdfPrioritized(base64ToUint8Array(r.pdf_base64));
+        await renderPdfFromUri(msg.pdfUri);
         statusEl.textContent = "Synced";
         statusEl.dataset.state = "ok";
       } else if (msg.type === "error") {

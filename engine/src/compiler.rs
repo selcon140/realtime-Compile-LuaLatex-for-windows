@@ -2,19 +2,18 @@ use crate::parser::{parse_and_split, BlockKind, TexBlock};
 use crate::synctex::{LineMapping, PdfSyncTarget, SourceMap, SyncTexIndex};
 use crate::worker_pool::{split_preamble_for_format, LuaTexWorkerPool};
 use crate::xref::{resolve_document_xref, XrefTable};
-use base64::Engine as _;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
 const MAX_CONCURRENT_WORKERS: usize = 4;
 
-/// 独立ブロック（preview環境）内で figure / table を安全に非フロート化するパッチ
 const NON_FLOAT_PATCH: &str = r#"
 \makeatletter
 \renewenvironment{figure}[1][]{%
@@ -45,10 +44,11 @@ const NON_FLOAT_PATCH: &str = r#"
 "#;
 
 pub struct EngineState {
-    pub last_good_pdf: Mutex<Option<Vec<u8>>>,
     pub synctex_index: Mutex<Option<SyncTexIndex>>,
     pub work_dir: PathBuf,
     pub cache_dir: PathBuf,
+    pub preview_dir: PathBuf,
+    pub preview_seq: AtomicU64,
     pub semaphore: Arc<Semaphore>,
     pub worker_pool: Arc<LuaTexWorkerPool>,
 }
@@ -56,7 +56,8 @@ pub struct EngineState {
 #[derive(Serialize)]
 pub struct CompileResponse {
     pub status: String,
-    pub pdf_base64: Option<String>,
+    /// Base64 の代わりに一時 PDF ファイルの絶対パスを返す
+    pub pdf_path: Option<String>,
     pub error_blocks: Vec<TexBlock>,
     pub cache_hits: usize,
     pub cache_misses: usize,
@@ -70,14 +71,20 @@ impl EngineState {
     pub fn new() -> Self {
         let work_dir = std::env::temp_dir().join("realtime_tex_vscode_engine");
         let cache_dir = work_dir.join("block_cache");
+        let preview_dir = work_dir.join("preview_out");
+        if preview_dir.exists() {
+            let _ = fs::remove_dir_all(&preview_dir);
+        }
         fs::create_dir_all(&cache_dir).unwrap();
+        fs::create_dir_all(&preview_dir).unwrap();
         let worker_pool = LuaTexWorkerPool::new(&work_dir);
 
         Self {
-            last_good_pdf: Mutex::new(None),
             synctex_index: Mutex::new(None),
             work_dir,
             cache_dir,
+            preview_dir,
+            preview_seq: AtomicU64::new(1),
             semaphore: Arc::new(Semaphore::new(MAX_CONCURRENT_WORKERS)),
             worker_pool,
         }
@@ -85,6 +92,9 @@ impl EngineState {
 
     pub async fn shutdown(&self, remove_all_cache: bool) {
         self.worker_pool.shutdown().await;
+        if self.preview_dir.exists() {
+            let _ = fs::remove_dir_all(&self.preview_dir);
+        }
         if remove_all_cache && self.work_dir.exists() {
             let _ = fs::remove_dir_all(&self.work_dir);
         }
@@ -93,6 +103,19 @@ impl EngineState {
     pub fn sync_to_pdf(&self, editor_line: usize) -> Option<PdfSyncTarget> {
         let guard = self.synctex_index.lock().unwrap();
         guard.as_ref()?.lookup_editor_line(editor_line)
+    }
+
+    /// プレビュー PDF を連番ファイルとして書き出し、3世代以上前のファイルを自動削除
+    fn write_preview_pdf(&self, bytes: &[u8]) -> Result<String, String> {
+        let seq = self.preview_seq.fetch_add(1, Ordering::Relaxed);
+        let path = self.preview_dir.join(format!("preview_{}.pdf", seq));
+        fs::write(&path, bytes).map_err(|e| e.to_string())?;
+
+        if seq > 3 {
+            let old = self.preview_dir.join(format!("preview_{}.pdf", seq - 3));
+            let _ = fs::remove_file(old);
+        }
+        Ok(path.to_string_lossy().into_owned())
     }
 
     pub async fn compile_incremental(
@@ -110,7 +133,7 @@ impl EngineState {
             let error_blocks = parsed.blocks.into_iter().filter(|b| b.has_error).collect();
             return CompileResponse {
                 status: "fallback_error".into(),
-                pdf_base64: None,
+                pdf_path: None,
                 error_blocks,
                 cache_hits: 0,
                 cache_misses: 0,
@@ -123,11 +146,9 @@ impl EngineState {
             };
         }
 
-        // 1. 相互参照とカウンタ値を組版から独立して先行解決
         let xref = resolve_document_xref(&parsed.blocks);
         let xref_preload = xref.to_latex_preload();
 
-        // 2. プリアンブル分離とメモリ常駐プリウォームワーカー同期
         let (dumpable_preamble, deferred_preamble) = split_preamble_for_format(&parsed.preamble);
         let fmt_hash = compute_sha256(&dumpable_preamble);
 
@@ -144,7 +165,6 @@ impl EngineState {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
 
-        // 3. カウンタ値・参照先番号・作業ディレクトリを織り込んだ実効キャッシュキーで判定
         let mut cache_hits = 0usize;
         let mut effective_keys: Vec<String> = Vec::with_capacity(parsed.blocks.len());
         let mut jobs: Vec<(String, String, String, String)> = Vec::new();
@@ -176,7 +196,6 @@ impl EngineState {
         }
         let cache_misses = jobs.len();
 
-        // 4. キャッシュミスした独立ブロックのみ並列コンパイル
         let mut join_set = JoinSet::new();
         let doc_dir_owned = document_dir.map(Path::to_path_buf);
 
@@ -227,7 +246,6 @@ impl EngineState {
             }
         }
 
-        // 5. 親文書の組み立てと SyncTeX インデックス更新
         let (master_body, source_map) = self.build_assembled_body(
             &deferred_preamble,
             &xref_preload,
@@ -242,30 +260,39 @@ impl EngineState {
             .await
         {
             Ok(job_out) => {
-                *self.last_good_pdf.lock().unwrap() = Some(job_out.pdf_bytes.clone());
-                if let Some(gz) = job_out.synctex_gz {
-                    if let Ok(index) = SyncTexIndex::parse_gz(&gz, source_map) {
-                        *self.synctex_index.lock().unwrap() = Some(index);
-                    }
+                if let Some(raw_sync) = job_out.synctex_raw {
+                    let index = SyncTexIndex::parse_raw(&raw_sync, source_map);
+                    *self.synctex_index.lock().unwrap() = Some(index);
                 }
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&job_out.pdf_bytes);
-                CompileResponse {
-                    status: "updated".into(),
-                    pdf_base64: Some(encoded),
-                    error_blocks: vec![],
-                    cache_hits,
-                    cache_misses,
-                    resolved_labels_count: xref.labels.len(),
-                    elapsed_ms: start.elapsed().as_millis(),
-                    mode: "incremental".into(),
-                    error_detail: None,
+                match self.write_preview_pdf(&job_out.pdf_bytes) {
+                    Ok(pdf_path) => CompileResponse {
+                        status: "updated".into(),
+                        pdf_path: Some(pdf_path),
+                        error_blocks: vec![],
+                        cache_hits,
+                        cache_misses,
+                        resolved_labels_count: xref.labels.len(),
+                        elapsed_ms: start.elapsed().as_millis(),
+                        mode: "incremental".into(),
+                        error_detail: None,
+                    },
+                    Err(e) => CompileResponse {
+                        status: "compile_error".into(),
+                        pdf_path: None,
+                        error_blocks: vec![],
+                        cache_hits,
+                        cache_misses,
+                        resolved_labels_count: xref.labels.len(),
+                        elapsed_ms: start.elapsed().as_millis(),
+                        mode: "incremental".into(),
+                        error_detail: Some(e),
+                    },
                 }
             }
             Err(_) => self.compile_raw_fallback(source, document_dir, start).await,
         }
     }
 
-    /// 分割コンパイル非互換な複雑な文書を、メモリ常駐ワーカー優先で直接コンパイルする
     async fn compile_raw_fallback(
         &self,
         source: &str,
@@ -302,31 +329,40 @@ impl EngineState {
 
         match job_result {
             Ok(job_out) => {
-                *self.last_good_pdf.lock().unwrap() = Some(job_out.pdf_bytes.clone());
-                if let Some(gz) = job_out.synctex_gz {
+                if let Some(raw_sync) = job_out.synctex_raw {
                     let total_lines = source.lines().count();
-                    if let Ok(index) =
-                        SyncTexIndex::parse_gz(&gz, SourceMap::identity(total_lines))
-                    {
-                        *self.synctex_index.lock().unwrap() = Some(index);
-                    }
+                    let index =
+                        SyncTexIndex::parse_raw(&raw_sync, SourceMap::identity(total_lines));
+                    *self.synctex_index.lock().unwrap() = Some(index);
                 }
-                let encoded = base64::engine::general_purpose::STANDARD.encode(&job_out.pdf_bytes);
-                CompileResponse {
-                    status: "updated".into(),
-                    pdf_base64: Some(encoded),
-                    error_blocks: vec![],
-                    cache_hits: 0,
-                    cache_misses: 0,
-                    resolved_labels_count: 0,
-                    elapsed_ms: start.elapsed().as_millis(),
-                    mode: "raw_warm".into(),
-                    error_detail: None,
+                match self.write_preview_pdf(&job_out.pdf_bytes) {
+                    Ok(pdf_path) => CompileResponse {
+                        status: "updated".into(),
+                        pdf_path: Some(pdf_path),
+                        error_blocks: vec![],
+                        cache_hits: 0,
+                        cache_misses: 0,
+                        resolved_labels_count: 0,
+                        elapsed_ms: start.elapsed().as_millis(),
+                        mode: "raw_warm".into(),
+                        error_detail: None,
+                    },
+                    Err(e) => CompileResponse {
+                        status: "compile_error".into(),
+                        pdf_path: None,
+                        error_blocks: vec![],
+                        cache_hits: 0,
+                        cache_misses: 0,
+                        resolved_labels_count: 0,
+                        elapsed_ms: start.elapsed().as_millis(),
+                        mode: "raw_warm".into(),
+                        error_detail: Some(e),
+                    },
                 }
             }
             Err(err_msg) => CompileResponse {
                 status: "compile_error".into(),
-                pdf_base64: None,
+                pdf_path: None,
                 error_blocks: vec![],
                 cache_hits: 0,
                 cache_misses: 0,

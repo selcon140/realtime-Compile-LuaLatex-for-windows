@@ -14,7 +14,7 @@ export interface TexBlock {
 
 export interface CompileResult {
   status: "updated" | "fallback_error" | "compile_error" | "cancelled";
-  pdf_base64: string | null;
+  pdf_path: string | null;
   error_blocks: TexBlock[];
   cache_hits: number;
   cache_misses: number;
@@ -106,7 +106,7 @@ export class EngineClient {
     }
     return {
       status: "compile_error",
-      pdf_base64: null,
+      pdf_path: null,
       error_blocks: [],
       cache_hits: 0,
       cache_misses: 0,

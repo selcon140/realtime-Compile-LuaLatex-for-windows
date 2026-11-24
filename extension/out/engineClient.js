@@ -110,7 +110,7 @@ class EngineClient {
         }
         return {
             status: "compile_error",
-            pdf_base64: null,
+            pdf_path: null,
             error_blocks: [],
             cache_hits: 0,
             cache_misses: 0,

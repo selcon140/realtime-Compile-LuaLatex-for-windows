@@ -10,16 +10,19 @@ use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::Mutex;
 use tokio::time::timeout;
 
-const POOL_SIZE: usize = 2;
-const DEFERRED_PACKAGES: &[&str] = &["hyperref", "bookmark", "cleveref", "preview"];
+const POOL_SIZE: usize = 3;
+/// メモリ常駐プリウォームでは hyperref 等もすべて先行展開できるため、preview のみ分離
+const DEFERRED_PACKAGES: &[&str] = &["preview"];
 const PREWARM_MARKER: &str = "@@PREWARM_READY@@";
+/// プレビュー用の高速無圧縮設定（LuaTeX プリミティブ）
+const UNCOMPRESSED_PDF_CMD: &str =
+    "\\pdfvariable compresslevel=0 \\pdfvariable objcompresslevel=0\n";
 
 pub struct JobOutput {
     pub pdf_bytes: Vec<u8>,
-    pub synctex_gz: Option<Vec<u8>>,
+    pub synctex_raw: Option<String>,
 }
 
-/// タスクがキャンセル（abort）されても一時スロットディレクトリを確実に削除する RAII ガード
 struct SlotDirGuard(PathBuf);
 
 impl Drop for SlotDirGuard {
@@ -109,7 +112,6 @@ impl LuaTexWorkerPool {
         }
     }
 
-    /// プリアンブルまたは作業ディレクトリが変わったら待機ワーカーを入れ替えて先行起動
     pub async fn sync_preamble(
         self: &Arc<Self>,
         dumpable_preamble: &str,
@@ -134,7 +136,6 @@ impl LuaTexWorkerPool {
             }
         }
 
-        // 古い待機ワーカーを破棄
         let stale: Vec<PrewarmedWorker> = {
             let mut pool = self.idle_workers.lock().await;
             pool.drain(..).collect()
@@ -153,7 +154,6 @@ impl LuaTexWorkerPool {
             *guard = Some(new_cfg.clone());
         }
 
-        // バックグラウンドでメモリ常駐ワーカーを先行起動
         for _ in 0..POOL_SIZE {
             let pool_clone = Arc::clone(self);
             let cfg_clone = new_cfg.clone();
@@ -165,7 +165,6 @@ impl LuaTexWorkerPool {
         Ok(())
     }
 
-    /// プリウォーム済みワーカーがあれば即座に使い、なければ直接起動で実行する
     pub async fn run_job(
         self: &Arc<Self>,
         preamble_hash: &str,
@@ -186,7 +185,6 @@ impl LuaTexWorkerPool {
             guard.clone().ok_or("Pool config not initialized")?
         };
 
-        // 生存しているプリウォーム済みワーカーをプールから1つ取り出す
         let warm_worker = {
             let mut pool = self.idle_workers.lock().await;
             let mut found = None;
@@ -203,7 +201,6 @@ impl LuaTexWorkerPool {
             found
         };
 
-        // 消費した分を裏で即座に1プロセス補充
         if warm_worker.is_some() {
             let pool_clone = Arc::clone(self);
             let cfg_clone = cfg.clone();
@@ -216,11 +213,10 @@ impl LuaTexWorkerPool {
             let _guard = SlotDirGuard(worker.slot_dir.clone());
             let tex_path = worker.slot_dir.join("job.tex");
             let pdf_path = worker.slot_dir.join("out.pdf");
-            let synctex_path = worker.slot_dir.join("out.synctex.gz");
+            let synctex_path = worker.slot_dir.join("out.synctex");
 
             fs::write(&tex_path, job_body).map_err(|e| e.to_string())?;
 
-            // メモリ上に展開済みのワーカーへ本文の \input 命令を流し込んで stdin を閉じる
             if worker.stdin.write_all(b"\\input{job.tex}\n").await.is_ok()
                 && worker.stdin.shutdown().await.is_ok()
             {
@@ -233,10 +229,10 @@ impl LuaTexWorkerPool {
                 match timeout(Duration::from_secs(120), wait_fut).await {
                     Ok(Ok(status)) if status.success() && pdf_path.exists() => {
                         let pdf_bytes = fs::read(&pdf_path).map_err(|e| e.to_string())?;
-                        let synctex_gz = fs::read(&synctex_path).ok();
+                        let synctex_raw = fs::read_to_string(&synctex_path).ok();
                         return Ok(JobOutput {
                             pdf_bytes,
-                            synctex_gz,
+                            synctex_raw,
                         });
                     }
                     Ok(Ok(_)) => {
@@ -251,12 +247,10 @@ impl LuaTexWorkerPool {
             }
         }
 
-        // プールが空だった場合（初回起動直後など）は直接実行
         let full_source = format!("{}\n{}", cfg.dumpable_preamble, job_body);
         self.run_raw_source(&full_source, document_dir).await
     }
 
-    /// 生ソース直接コンパイル（フォールバック用・ローカル画像対応）
     pub async fn run_raw_source(
         self: &Arc<Self>,
         full_source: &str,
@@ -273,8 +267,11 @@ impl LuaTexWorkerPool {
 
         let tex_path = slot_dir.join("job.tex");
         let pdf_path = slot_dir.join("out.pdf");
-        let synctex_path = slot_dir.join("out.synctex.gz");
-        fs::write(&tex_path, full_source).map_err(|e| e.to_string())?;
+        let synctex_path = slot_dir.join("out.synctex");
+
+        // 無圧縮設定を先頭に付与（行番号ズレを防ぐため1行目に連結せず直後へ配置）
+        let patched_source = format!("{}{}", UNCOMPRESSED_PDF_CMD, full_source);
+        fs::write(&tex_path, patched_source).map_err(|e| e.to_string())?;
 
         let mut cmd = Command::new("lualatex");
         cmd.current_dir(&slot_dir)
@@ -289,7 +286,7 @@ impl LuaTexWorkerPool {
             "-jobname=out",
             "-interaction=nonstopmode",
             "-halt-on-error",
-            "-synctex=1",
+            "-synctex=-1", // 非圧縮 .synctex を出力
             "job.tex",
         ]);
 
@@ -300,10 +297,10 @@ impl LuaTexWorkerPool {
 
         if output.status.success() && pdf_path.exists() {
             let pdf_bytes = fs::read(&pdf_path).map_err(|e| e.to_string())?;
-            let synctex_gz = fs::read(&synctex_path).ok();
+            let synctex_raw = fs::read_to_string(&synctex_path).ok();
             Ok(JobOutput {
                 pdf_bytes,
-                synctex_gz,
+                synctex_raw,
             })
         } else {
             let log = String::from_utf8_lossy(&output.stdout).into_owned();
@@ -311,7 +308,6 @@ impl LuaTexWorkerPool {
         }
     }
 
-    /// バックグラウンドでプリアンブルをメモリ展開し、stdin 待機状態のワーカーを生成してプールへ積む
     async fn spawn_and_enqueue_prewarmed(&self, cfg: PoolConfig) {
         if self.is_shutting_down.load(Ordering::SeqCst) {
             return;
@@ -325,8 +321,8 @@ impl LuaTexWorkerPool {
 
         let init_path = slot_dir.join("preamble_init.tex");
         let init_src = format!(
-            "{}\n\\typeout{{{}}}\n",
-            cfg.dumpable_preamble, PREWARM_MARKER
+            "{}\n{}\n\\typeout{{{}}}\n",
+            cfg.dumpable_preamble, UNCOMPRESSED_PDF_CMD, PREWARM_MARKER
         );
         if fs::write(&init_path, init_src).is_err() {
             let _ = fs::remove_dir_all(&slot_dir);
@@ -342,12 +338,11 @@ impl LuaTexWorkerPool {
 
         apply_texinputs(&mut cmd, cfg.key.document_dir.as_deref());
 
-        // ファイル引数を渡さずに起動することで、stdin がメイン入力ストリームとして待機状態になる
         cmd.args([
             "-jobname=out",
             "-interaction=nonstopmode",
             "-halt-on-error",
-            "-synctex=1",
+            "-synctex=-1", // 非圧縮 .synctex を出力
         ]);
 
         let Ok(mut child) = cmd.spawn() else {
@@ -366,7 +361,6 @@ impl LuaTexWorkerPool {
             return;
         };
 
-        // プリアンブルを読み込ませてフラッシュ（stdin は閉じない）
         if stdin.write_all(b"\\input{preamble_init.tex}\n").await.is_err()
             || stdin.flush().await.is_err()
         {
@@ -375,7 +369,6 @@ impl LuaTexWorkerPool {
             return;
         }
 
-        // @@PREWARM_READY@@ が出力されるまで待機（メモリ展開完了の確認）
         let mut reader = BufReader::new(stdout);
         let ready = timeout(Duration::from_secs(30), async {
             let mut line = String::new();
@@ -400,7 +393,6 @@ impl LuaTexWorkerPool {
             return;
         }
 
-        // 待機中にプリアンブルが変更・終了していなければプールへ登録
         let still_valid = !self.is_shutting_down.load(Ordering::SeqCst)
             && self
                 .config

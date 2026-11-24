@@ -92,7 +92,7 @@ async fn main() {
                             id: old_id,
                             result: CompileResponse {
                                 status: "cancelled".into(),
-                                pdf_base64: None,
+                                pdf_path: None,
                                 error_blocks: vec![],
                                 cache_hits: 0,
                                 cache_misses: 0,
