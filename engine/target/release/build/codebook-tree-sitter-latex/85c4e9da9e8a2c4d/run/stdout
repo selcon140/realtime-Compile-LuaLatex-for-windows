@@ -1,0 +1,146 @@
+cargo:rerun-if-changed=src\parser.c
+cargo:rerun-if-changed=src\scanner.c
+cargo:rerun-if-env-changed=CC_FORCE_DISABLE
+CC_FORCE_DISABLE = None
+cargo:rerun-if-env-changed=CC_PREFER_CLANG_CL_OVER_MSVC
+CC_PREFER_CLANG_CL_OVER_MSVC = None
+cargo:rerun-if-env-changed=VCINSTALLDIR
+VCINSTALLDIR = None
+cargo:rerun-if-env-changed=VSTEL_MSBuildProjectFullPath
+VSTEL_MSBuildProjectFullPath = None
+cargo:rerun-if-env-changed=VCToolsVersion
+VCToolsVersion = None
+cargo:rerun-if-env-changed=VSCMD_ARG_VCVARS_SPECTRE
+VSCMD_ARG_VCVARS_SPECTRE = None
+cargo:rerun-if-env-changed=WindowsSdkDir
+WindowsSdkDir = None
+cargo:rerun-if-env-changed=WindowsSDKVersion
+WindowsSDKVersion = None
+cargo:rerun-if-env-changed=LIB
+LIB = None
+PATH = Some(C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\lib;C:\Program Files\PowerShell\7;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\texlive\2025\bin\windows;C:\Program Files\Git\cmd;C:\Program Files\Wolfram Research\WolframScript\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\PowerShell\7\;C:\Program Files\nodejs\;C:\Users\dynab\.cargo\bin;C:\texlive\2026\bin\windows;C:\Users\dynab\AppData\Local\Programs\Python\Python313\Scripts\;C:\Users\dynab\AppData\Local\Programs\Python\Python313\;C:\Users\dynab\AppData\Local\Microsoft\WindowsApps;C:\texlive\2025\bin\windows;C:\mingw64\mingw64\bin;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin;C:\texlive\2025\bin\windows;C:\Users\dynab\AppData\Local\Microsoft\WinGet\Links;C:\Users\dynab\AppData\Local\Box\Box Edit\;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\AppData\Roaming\npm;c:\Users\dynab\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin)
+cargo:rerun-if-env-changed=INCLUDE
+INCLUDE = None
+cargo:rerun-if-env-changed=CC_x86_64-pc-windows-msvc
+CC_x86_64-pc-windows-msvc = None
+cargo:rerun-if-env-changed=CC_x86_64_pc_windows_msvc
+CC_x86_64_pc_windows_msvc = None
+cargo:rerun-if-env-changed=HOST_CC
+HOST_CC = None
+cargo:rerun-if-env-changed=CC
+CC = None
+cargo:rerun-if-env-changed=EXTERNAL_INCLUDE
+cargo:rerun-if-env-changed=CL
+cargo:rerun-if-env-changed=_CL_
+cargo:rerun-if-env-changed=LIBPATH
+cargo:rerun-if-env-changed=CRATE_CC_NO_DEFAULTS
+CRATE_CC_NO_DEFAULTS = None
+cargo:rerun-if-env-changed=CFLAGS
+CFLAGS = None
+cargo:rerun-if-env-changed=HOST_CFLAGS
+HOST_CFLAGS = None
+cargo:rerun-if-env-changed=CFLAGS_x86_64_pc_windows_msvc
+CFLAGS_x86_64_pc_windows_msvc = None
+cargo:rerun-if-env-changed=CFLAGS_x86_64-pc-windows-msvc
+CFLAGS_x86_64-pc-windows-msvc = None
+cargo:rerun-if-env-changed=CC_ENABLE_DEBUG_OUTPUT
+parser.c
+src\parser.c(24396): warning C4102: 'next_state': ラベルは 1 度も参照されません。
+C:\Users\dynab\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\codebook-tree-sitter-latex-0.6.1\src\parser.c(24396) : warning C4702: 制御が渡らないコードです。
+scanner.c
+src\scanner.c(58): warning C4244: '初期化中': 'int32_t' から 'char' への変換です。データが失われる可能性があります。
+src\scanner.c(86): warning C4100: 'payload': 参照されないパラメーター
+src\scanner.c(89): warning C4100: 'buffer': 参照されないパラメーター
+src\scanner.c(88): warning C4100: 'payload': 参照されないパラメーター
+src\scanner.c(95): warning C4100: 'length': 参照されないパラメーター
+src\scanner.c(94): warning C4100: 'buffer': 参照されないパラメーター
+src\scanner.c(93): warning C4100: 'payload': 参照されないパラメーター
+src\scanner.c(107): warning C4244: '=': 'int' から 'TSSymbol' への変換です。データが失われる可能性があります。
+src\scanner.c(97): warning C4100: 'payload': 参照されないパラメーター
+CC_FORCE_DISABLE = None
+cargo:rerun-if-env-changed=AR_x86_64-pc-windows-msvc
+AR_x86_64-pc-windows-msvc = None
+cargo:rerun-if-env-changed=AR_x86_64_pc_windows_msvc
+AR_x86_64_pc_windows_msvc = None
+cargo:rerun-if-env-changed=HOST_AR
+HOST_AR = None
+cargo:rerun-if-env-changed=AR
+AR = None
+CC_PREFER_CLANG_CL_OVER_MSVC = None
+VCINSTALLDIR = None
+VSTEL_MSBuildProjectFullPath = None
+VCToolsVersion = None
+VSCMD_ARG_VCVARS_SPECTRE = None
+WindowsSdkDir = None
+WindowsSDKVersion = None
+LIB = None
+PATH = Some(C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\lib;C:\Program Files\PowerShell\7;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\texlive\2025\bin\windows;C:\Program Files\Git\cmd;C:\Program Files\Wolfram Research\WolframScript\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\PowerShell\7\;C:\Program Files\nodejs\;C:\Users\dynab\.cargo\bin;C:\texlive\2026\bin\windows;C:\Users\dynab\AppData\Local\Programs\Python\Python313\Scripts\;C:\Users\dynab\AppData\Local\Programs\Python\Python313\;C:\Users\dynab\AppData\Local\Microsoft\WindowsApps;C:\texlive\2025\bin\windows;C:\mingw64\mingw64\bin;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin;C:\texlive\2025\bin\windows;C:\Users\dynab\AppData\Local\Microsoft\WinGet\Links;C:\Users\dynab\AppData\Local\Box\Box Edit\;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\AppData\Roaming\npm;c:\Users\dynab\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin)
+INCLUDE = None
+CC_x86_64-pc-windows-msvc = None
+CC_x86_64_pc_windows_msvc = None
+HOST_CC = None
+CC = None
+VCINSTALLDIR = None
+VSTEL_MSBuildProjectFullPath = None
+VCToolsVersion = None
+VSCMD_ARG_VCVARS_SPECTRE = None
+WindowsSdkDir = None
+WindowsSDKVersion = None
+LIB = None
+PATH = Some(C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\lib;C:\Program Files\PowerShell\7;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\texlive\2025\bin\windows;C:\Program Files\Git\cmd;C:\Program Files\Wolfram Research\WolframScript\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\PowerShell\7\;C:\Program Files\nodejs\;C:\Users\dynab\.cargo\bin;C:\texlive\2026\bin\windows;C:\Users\dynab\AppData\Local\Programs\Python\Python313\Scripts\;C:\Users\dynab\AppData\Local\Programs\Python\Python313\;C:\Users\dynab\AppData\Local\Microsoft\WindowsApps;C:\texlive\2025\bin\windows;C:\mingw64\mingw64\bin;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin;C:\texlive\2025\bin\windows;C:\Users\dynab\AppData\Local\Microsoft\WinGet\Links;C:\Users\dynab\AppData\Local\Box\Box Edit\;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\AppData\Roaming\npm;c:\Users\dynab\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin)
+INCLUDE = None
+cargo:rerun-if-env-changed=ARFLAGS
+ARFLAGS = None
+cargo:rerun-if-env-changed=HOST_ARFLAGS
+HOST_ARFLAGS = None
+cargo:rerun-if-env-changed=ARFLAGS_x86_64_pc_windows_msvc
+ARFLAGS_x86_64_pc_windows_msvc = None
+cargo:rerun-if-env-changed=ARFLAGS_x86_64-pc-windows-msvc
+ARFLAGS_x86_64-pc-windows-msvc = None
+AR_x86_64-pc-windows-msvc = None
+AR_x86_64_pc_windows_msvc = None
+HOST_AR = None
+AR = None
+CC_PREFER_CLANG_CL_OVER_MSVC = None
+VCINSTALLDIR = None
+VSTEL_MSBuildProjectFullPath = None
+VCToolsVersion = None
+VSCMD_ARG_VCVARS_SPECTRE = None
+WindowsSdkDir = None
+WindowsSDKVersion = None
+LIB = None
+PATH = Some(C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\lib;C:\Program Files\PowerShell\7;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\texlive\2025\bin\windows;C:\Program Files\Git\cmd;C:\Program Files\Wolfram Research\WolframScript\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\PowerShell\7\;C:\Program Files\nodejs\;C:\Users\dynab\.cargo\bin;C:\texlive\2026\bin\windows;C:\Users\dynab\AppData\Local\Programs\Python\Python313\Scripts\;C:\Users\dynab\AppData\Local\Programs\Python\Python313\;C:\Users\dynab\AppData\Local\Microsoft\WindowsApps;C:\texlive\2025\bin\windows;C:\mingw64\mingw64\bin;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin;C:\texlive\2025\bin\windows;C:\Users\dynab\AppData\Local\Microsoft\WinGet\Links;C:\Users\dynab\AppData\Local\Box\Box Edit\;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\AppData\Roaming\npm;c:\Users\dynab\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin)
+INCLUDE = None
+CC_x86_64-pc-windows-msvc = None
+CC_x86_64_pc_windows_msvc = None
+HOST_CC = None
+CC = None
+VCINSTALLDIR = None
+VSTEL_MSBuildProjectFullPath = None
+VCToolsVersion = None
+VSCMD_ARG_VCVARS_SPECTRE = None
+WindowsSdkDir = None
+WindowsSDKVersion = None
+LIB = None
+PATH = Some(C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\lib;C:\Program Files\PowerShell\7;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\texlive\2025\bin\windows;C:\Program Files\Git\cmd;C:\Program Files\Wolfram Research\WolframScript\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\PowerShell\7\;C:\Program Files\nodejs\;C:\Users\dynab\.cargo\bin;C:\texlive\2026\bin\windows;C:\Users\dynab\AppData\Local\Programs\Python\Python313\Scripts\;C:\Users\dynab\AppData\Local\Programs\Python\Python313\;C:\Users\dynab\AppData\Local\Microsoft\WindowsApps;C:\texlive\2025\bin\windows;C:\mingw64\mingw64\bin;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin;C:\texlive\2025\bin\windows;C:\Users\dynab\AppData\Local\Microsoft\WinGet\Links;C:\Users\dynab\AppData\Local\Box\Box Edit\;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\AppData\Roaming\npm;c:\Users\dynab\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin)
+INCLUDE = None
+ARFLAGS = None
+HOST_ARFLAGS = None
+ARFLAGS_x86_64_pc_windows_msvc = None
+ARFLAGS_x86_64-pc-windows-msvc = None
+CC_PREFER_CLANG_CL_OVER_MSVC = None
+VCINSTALLDIR = None
+VSTEL_MSBuildProjectFullPath = None
+VCToolsVersion = None
+VSCMD_ARG_VCVARS_SPECTRE = None
+WindowsSdkDir = None
+WindowsSDKVersion = None
+LIB = None
+PATH = Some(C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\lib\rustlib\x86_64-pc-windows-msvc\lib;C:\Program Files\PowerShell\7;C:\Windows\system32;C:\Windows;C:\Windows\System32\Wbem;C:\Windows\System32\WindowsPowerShell\v1.0\;C:\Windows\System32\OpenSSH\;C:\Program Files\dotnet\;C:\texlive\2025\bin\windows;C:\Program Files\Git\cmd;C:\Program Files\Wolfram Research\WolframScript\;C:\Program Files (x86)\Windows Kits\10\Windows Performance Toolkit\;C:\Program Files\PowerShell\7\;C:\Program Files\nodejs\;C:\Users\dynab\.cargo\bin;C:\texlive\2026\bin\windows;C:\Users\dynab\AppData\Local\Programs\Python\Python313\Scripts\;C:\Users\dynab\AppData\Local\Programs\Python\Python313\;C:\Users\dynab\AppData\Local\Microsoft\WindowsApps;C:\texlive\2025\bin\windows;C:\mingw64\mingw64\bin;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin;C:\texlive\2025\bin\windows;C:\Users\dynab\AppData\Local\Microsoft\WinGet\Links;C:\Users\dynab\AppData\Local\Box\Box Edit\;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\AppData\Roaming\npm;c:\Users\dynab\AppData\Roaming\Code\User\globalStorage\github.copilot-chat\debugCommand;C:\Users\dynab\AppData\Local\Programs\Microsoft VS Code\bin\copilot-shim;C:\Users\dynab\.rustup\toolchains\stable-x86_64-pc-windows-msvc\bin)
+INCLUDE = None
+CC_x86_64-pc-windows-msvc = None
+CC_x86_64_pc_windows_msvc = None
+HOST_CC = None
+CC = None
+cargo:rustc-link-lib=static=tree-sitter-latex
+cargo:rustc-link-search=native=C:\Users\dynab\Desktop\realtime-tex-vscode\engine\target\release\build\codebook-tree-sitter-latex/85c4e9da9e8a2c4d\out
