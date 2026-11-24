@@ -67,6 +67,7 @@ struct QueuedCompile {
     line: usize,
     draft: bool,
     doc_dir: Option<PathBuf>,
+    queued_at: std::time::Instant,
 }
 
 #[tokio::main]
@@ -96,16 +97,30 @@ async fn main() {
                     continue;
                 };
 
-                let result = engine_bg
-                    .compile_incremental(
-                        &job.source,
-                        job.line,
-                        job.draft,
-                        job.doc_dir.as_deref(),
-                    )
-                    .await;
-                let resp = Response::CompileResult { id: job.id, result };
-                write_response(&stdout_bg, &resp).await;
+               let queue_ms = job.queued_at.elapsed().as_millis();
+let kind = if job.draft { "draft" } else { "full" };
+
+eprintln!(
+    "[tex:start] id={} kind={} queue={}ms",
+    job.id, kind, queue_ms
+);
+
+let result = engine_bg
+    .compile_incremental(
+        &job.source,
+        job.line,
+        job.draft,
+        job.doc_dir.as_deref(),
+    )
+    .await;
+
+eprintln!(
+    "[tex:done] id={} kind={} mode={} queue={}ms engine={}ms",
+    job.id, kind, result.mode, queue_ms, result.elapsed_ms
+);
+
+let resp = Response::CompileResult { id: job.id, result };
+write_response(&stdout_bg, &resp).await;
             }
         });
     }
@@ -156,12 +171,13 @@ async fn main() {
             } => {
                 let doc_dir = document_dir.filter(|s| !s.is_empty()).map(PathBuf::from);
                 let replaced = pending_job.lock().await.replace(QueuedCompile {
-                    id,
-                    source,
-                    line,
-                    draft,
-                    doc_dir,
-                });
+    id,
+    source,
+    line,
+    draft,
+    doc_dir,
+    queued_at: std::time::Instant::now(), // 追加
+});
 
                 // まだ未着手だった古い待機リクエストがあれば即座に cancelled を返して Promise を解放
                 if let Some(old) = replaced {

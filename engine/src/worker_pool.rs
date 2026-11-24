@@ -17,6 +17,8 @@ const PREFIX_MARKER: &str = "@@PREFIX_READY@@";
 const UNCOMPRESSED_PDF_CMD: &str =
     "\\pdfvariable compresslevel=0 \\pdfvariable objcompresslevel=0\n";
 
+pub const DRAFT_DEFERRED: &str = "__realtime_tex_draft_deferred__";
+
 pub struct JobOutput {
     pub pdf_bytes: Vec<u8>,
     pub synctex_raw: Option<String>,
@@ -231,6 +233,7 @@ impl LuaTexWorkerPool {
         suffix_content: &str,
         full_source: &str,
         is_full_document: bool,
+        allow_cold_start: bool,
         document_dir: Option<&Path>,
     ) -> Result<JobOutput, String> {
         if self.is_shutting_down.load(Ordering::SeqCst) {
@@ -280,7 +283,42 @@ impl LuaTexWorkerPool {
         }
 
         // 2. 第1ゲート待機中の PrewarmedWorker があればそれを使用
-        if let Some(worker) = self.pop_alive_warm_worker(&target_key).await {
+        let mut available_worker = self.pop_alive_warm_worker(&target_key).await;
+
+// 全文同期に限り、補充中のワーカーがまもなく使える可能性を考えて少し待つ。
+// ドラフトは allow_cold_start == false なので、この待機には入らない。
+if available_worker.is_none() && allow_cold_start {
+    use tokio::time::{sleep_until, Duration, Instant};
+
+    const FULL_WARM_GRACE: Duration = Duration::from_millis(2500);
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    self.replenish_notify.notify_one();
+
+    let started = Instant::now();
+    let deadline = started + FULL_WARM_GRACE;
+
+    while Instant::now() < deadline {
+        if self.is_shutting_down.load(Ordering::SeqCst) {
+            return Err("Worker pool is shutting down".into());
+        }
+
+        sleep_until((Instant::now() + POLL_INTERVAL).min(deadline)).await;
+
+        available_worker = self.pop_alive_warm_worker(&target_key).await;
+        if available_worker.is_some() {
+            break;
+        }
+    }
+
+    eprintln!(
+        "[tex:warm-grace] kind=full waited={}ms acquired={}",
+        started.elapsed().as_millis(),
+        available_worker.is_some()
+    );
+}
+
+if let Some(worker) = available_worker {
             self.replenish_notify.notify_one();
             self.spawn_next_stage_in_bg(preamble_hash, prefix_content, prefix_hash, document_dir);
 
@@ -293,10 +331,17 @@ impl LuaTexWorkerPool {
             }
         }
 
-        // 3. 初回起動直後でプールがまだ空の場合のみコールドスタート
         self.replenish_notify.notify_one();
-        self.run_raw_source(full_source, preamble_hash, true, document_dir)
-            .await
+
+// 入力途中の版のために、新しいLuaLaTeXをゼロから起動しない。
+// 待機ワーカーの補充はバックグラウンドで続ける。
+if !allow_cold_start {
+    return Err(DRAFT_DEFERRED.to_owned());
+}
+
+// 初回表示・入力停止後の全文同期は、ワーカーがなくても実行する。
+self.run_raw_source(full_source, preamble_hash, true, document_dir)
+    .await
     }
 
     fn spawn_next_stage_in_bg(

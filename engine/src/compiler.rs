@@ -1,6 +1,6 @@
 use crate::parser::TexBlock;
 use crate::synctex::{PdfSyncTarget, SyncTexIndex};
-use crate::worker_pool::LuaTexWorkerPool;
+use crate::worker_pool::{LuaTexWorkerPool, DRAFT_DEFERRED};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::fs;
@@ -158,12 +158,18 @@ impl EngineState {
                 &suffix_with_end,
                 source,
                 !used_truncated,
+                !allow_draft,
                 document_dir,
             )
             .await;
 
         // もし高速ドラフトの部分切断でマクロ等の不整合が起きた場合は、即座に全文 suffix で再実行して誤エラーを防ぐ
-        if job_result.is_err() && used_truncated {
+        let should_retry = match &job_result {
+    Err(message) => used_truncated && message.as_str() != DRAFT_DEFERRED,
+    Ok(_) => false,
+};
+
+if should_retry {
             used_truncated = false;
             let full_split =
                 split_body_around_cursor(source, begin_end, end_doc_start, cursor_byte, false);
@@ -178,6 +184,7 @@ impl EngineState {
                     &full_suffix,
                     source,
                     true,
+                    !allow_draft,
                     document_dir,
                 )
                 .await;
@@ -231,6 +238,18 @@ impl EngineState {
                     },
                 }
             }
+            Err(err_msg) if err_msg.as_str() == DRAFT_DEFERRED => CompileResponse {
+    // 既存の通信型を流用する。通常のcancelledとはmodeで区別する。
+    status: "cancelled".into(),
+    pdf_path: None,
+    error_blocks: vec![],
+    cache_hits: 0,
+    cache_misses: 1,
+    resolved_labels_count: 0,
+    elapsed_ms: start.elapsed().as_millis(),
+    mode: "draft_deferred".into(),
+    error_detail: None,
+},
             Err(err_msg) => CompileResponse {
                 status: "compile_error".into(),
                 pdf_path: None,
