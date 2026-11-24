@@ -1,0 +1,55 @@
+{
+  "name": "realtime-tex-preview",
+  "displayName": "Realtime TeX Preview",
+  "description": "Incremental LuaLaTeX real-time preview with local asset support and SyncTeX",
+  "version": "0.1.0",
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "onLanguage:latex",
+    "onCommand:realtimeTex.openPreview"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "realtimeTex.openPreview",
+        "title": "Realtime TeX: Open Preview",
+        "icon": "$(open-preview)"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "when": "resourceExtname == .tex",
+          "command": "realtimeTex.openPreview",
+          "group": "navigation"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Realtime TeX Preview",
+      "properties": {
+        "realtimeTex.enginePath": {
+          "type": "string",
+          "default": "",
+          "description": "Optional custom path to realtime-tex-server executable"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./"
+  },
+  "dependencies": {
+    "pdfjs-dist": "^4.8.69"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.85.0",
+    "typescript": "^5.6.0"
+  }
+}
