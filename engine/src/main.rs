@@ -1,7 +1,9 @@
 mod compiler;
+#[allow(dead_code)]
 mod parser;
 mod synctex;
 mod worker_pool;
+#[allow(dead_code)]
 mod xref;
 
 use compiler::{CompileResponse, EngineState};
